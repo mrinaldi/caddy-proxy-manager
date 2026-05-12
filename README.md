@@ -16,6 +16,54 @@ This project provides a web UI for Caddy Server, eliminating the need to manuall
 
 ---
 
+## Fork Changes
+
+This fork adds two features not present in the original project:
+
+### 1. Config Merge Mode (`CADDY_CONFIG_MODE=merge`)
+
+The original CPM pushes its config via `POST /load`, which **replaces the entire
+Caddy config** — any custom Caddyfile entries are wiped out on every save. This
+fork introduces a read-merge-write mode:
+
+```
+CADDY_CONFIG_MODE=merge
+```
+
+When enabled, CPM reads the current running config via `GET /config/`, merges
+only its managed sections into it, and applies the result. Your custom Caddyfile
+entries (global options, non-CPM sites, custom TLS config) are preserved.
+
+**CPM owns exactly four config paths:**
+- `apps.http.servers.cpm` — reverse proxy hosts
+- `apps.tls` — certificate automation + loaded PEMs
+- `apps.layer4` — L4 TCP/UDP proxy servers
+- `apps.logging.logs` — WAF rules logger + HTTP access logger
+
+Everything else is left untouched. The merge logic lives in
+[`src/lib/caddy-merge.ts`](src/lib/caddy-merge.ts) — new file, zero changes to
+existing logic. Default mode (`replace`) is 100% identical to upstream behavior.
+
+### 2. Proxmox / Non-Docker Deployment
+
+Systemd service files, environment templates, and an installation script for
+running CPM directly on a Proxmox LXC container (or any Linux host) without
+Docker. See [`docs/proxmox-deployment.md`](docs/proxmox-deployment.md) for the
+full guide.
+
+### Upstream Compatibility
+
+All changes are:
+- **Feature-flagged** — `CADDY_CONFIG_MODE` defaults to `replace` (upstream behavior)
+- **Zero-touch** on existing files — merge logic is a new module, `caddy.ts` gets ~15 lines
+- **Isolated** — Proxmox scripts live in `deploy/proxmox/`, documentation in `docs/`
+
+Merging upstream updates: `git merge upstream/main` should produce no conflicts
+in the modified files. If upstream adds new config sections, extend the merge
+list in `caddy-merge.ts`.
+
+---
+
 ## Installation
 
 ```bash
@@ -29,27 +77,6 @@ docker compose up -d
 Access at `http://localhost:3000/login`
 
 Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, caddy-logs).
-
-### Proxmox / Non-Docker Deployment
-
-CPM can also run directly on a Proxmox LXC container (or any Linux host)
-alongside a standard Caddy installation. This lets you maintain your own
-Caddyfile with custom sites while CPM manages only its proxy host entries.
-
-Key differences from the Docker setup:
-
-| Docker | Proxmox |
-|--------|---------|
-| `CADDY_API_URL=http://caddy:2019` | `CADDY_API_URL=http://localhost:2019` |
-| Full `POST /load` replacement | `CADDY_CONFIG_MODE=merge` preserves user Caddyfile |
-| Docker Compose manages services | systemd manages services |
-| Container networking | Localhost communication |
-
-**Use `CADDY_CONFIG_MODE=merge`** — CPM reads the running config, merges only
-its managed sections (proxy hosts, TLS, L4, logging), and preserves everything
-else. Without this flag, CPM replaces the entire Caddy config on every change.
-
-See [`docs/proxmox-deployment.md`](docs/proxmox-deployment.md) for the full guide.
 
 ---
 
@@ -96,7 +123,6 @@ See [`docs/proxmox-deployment.md`](docs/proxmox-deployment.md) for the full guid
 | `ADMIN_PASSWORD` | Admin password (see requirements below) | `admin` (dev only) | **Yes** |
 | `BASE_URL` | Public URL where users access the dashboard.<br/>**Required for OAuth** - must match redirect URI | `http://localhost:3000` | **Yes** (if using OAuth) |
 | `CADDY_API_URL` | Caddy Admin API endpoint | `http://caddy:2019` (prod)<br/>`http://localhost:2019` (dev) | No |
-| `CADDY_CONFIG_MODE` | Config application mode: `replace` (full POST /load) or `merge` (preserve user Caddyfile entries) | `replace` | No |
 | `DATABASE_URL` | SQLite database URL | `file:/app/data/caddy-proxy-manager.db` | No |
 | `CERTS_DIRECTORY` | Certificate storage directory | `./data/certs` | No |
 | `LOGIN_MAX_ATTEMPTS` | Max login attempts before rate limit | `5` | No |
