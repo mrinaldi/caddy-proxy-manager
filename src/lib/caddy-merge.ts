@@ -149,26 +149,6 @@ async function readCurrentCaddyConfig(): Promise<Record<string, unknown> | null>
 // ---------------------------------------------------------------------------
 
 /**
- * Known CPM-managed config paths.
- * Keys are dot-separated paths in the CPM document, values describe the
- * merge strategy:
- *   "replace" — replace the subtree entirely with CPM's version
- *   "merge"   — merge CPM's object into the target (shallow merge of keys)
- *
- * @note When a managed section is empty/falsy in CPM's document, it is
- *       removed from the merged config (via delete).
- */
-const MANAGED_SECTIONS: Record<
-  string,
-  { strategy: "replace" | "merge"; optional?: boolean }
-> = {
-  "apps.http.servers.cpm": { strategy: "replace" },
-  apps: { strategy: "replace", optional: true },
-  layer4: { strategy: "replace", optional: true },
-  "apps.logging.logs": { strategy: "merge" },
-};
-
-/**
  * Merge CPM's sections into the current running config.
  *
  * @param currentConfig  The config read from Caddy's GET /config/
