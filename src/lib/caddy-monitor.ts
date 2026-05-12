@@ -1,12 +1,25 @@
 /**
  * Caddy health monitoring service
- * Monitors Caddy for restarts/crashes and automatically reapplies configuration
+ * Monitors Caddy for restarts/crashes and automatically reapplies configuration.
+ *
+ * ## Reload detection (merge mode)
+ *
+ * After every CPM config push, the resulting config ETag is stored via
+ * `recordPushEtag()` in caddy.ts. On each health check, the current ETag is
+ * compared with the stored push ETag:
+ *
+ *   - Same ETag  → CPM's config is still intact → no action
+ *   - Different  → something else changed the config (e.g. `caddy reload`,
+ *                  manual POST /load, etc.) → re-apply the merge
+ *
+ * This is more robust than probing a specific config path because it works
+ * regardless of whether CPM currently has proxy hosts configured.
  */
 
 import http from "node:http";
 import https from "node:https";
 import { config } from "./config";
-import { applyCaddyConfig, caddyRequest } from "./caddy";
+import { applyCaddyConfig, getLastPushEtag } from "./caddy";
 
 type CaddyMonitorState = {
   isHealthy: boolean;
@@ -18,7 +31,6 @@ type CaddyMonitorState = {
 const HEALTH_CHECK_INTERVAL = 10000; // Check every 10 seconds
 const MAX_CONSECUTIVE_FAILURES = 3; // Consider unhealthy after 3 failures
 const REAPPLY_DELAY = 5000; // Wait 5 seconds after detecting restart before reapplying
-const MIN_REAPPLY_INTERVAL = 30000; // Minimum interval between merge re-applies (prevents tight loops)
 
 const monitorState: CaddyMonitorState = {
   isHealthy: false,
@@ -29,7 +41,6 @@ const monitorState: CaddyMonitorState = {
 
 let monitorInterval: NodeJS.Timeout | null = null;
 let isMonitoring = false;
-let lastReapplyTime = 0; // Timestamp of last merge-mode re-apply (debounce)
 
 /**
  * Get the current Caddy config ID from the admin API
@@ -129,50 +140,30 @@ async function checkCaddyHealth(): Promise<void> {
     console.log("[CaddyMonitor] Caddy health monitoring initialized");
     monitorState.lastConfigId = currentConfigId;
   } else {
-    // Normal operation — config may have changed (e.g. Caddy reload)
+    // Normal operation — detect external config changes via ETag comparison.
+    // If the current ETag differs from the last-push ETag, something other
+    // than CPM changed the config (e.g. `caddy reload`). Re-apply the merge.
     if (
       config.caddyConfigMode === "merge" &&
-      monitorState.lastConfigId !== null &&
-      currentConfigId !== monitorState.lastConfigId
+      currentConfigId !== null &&
+      currentConfigId !== "empty" &&
+      currentConfigId !== "configured"
     ) {
-      await reapplyIfSectionMissing();
+      const pushEtag = getLastPushEtag();
+      if (pushEtag !== null && currentConfigId !== pushEtag) {
+        console.log(
+          "[CaddyMonitor] Config ETag differs from last CPM push — likely a Caddy reload. Reapplying merge..."
+        );
+        try {
+          await applyCaddyConfig();
+          console.log("[CaddyMonitor] Merge re-applied successfully after reload");
+        } catch (error) {
+          console.error("[CaddyMonitor] Failed to reapply merge after reload:", error);
+        }
+      }
     }
 
     monitorState.lastConfigId = currentConfigId;
-  }
-}
-
-/**
- * After a config change is detected, check whether CPM-managed sections
- * still exist in the running config. If they're missing (e.g., after a
- * `caddy reload` that re-reads the Caddyfile), re-apply the merge.
- *
- * Uses a lightweight GET on the CPM-owned section path to avoid the full
- * config fetch. Debounced to MIN_REAPPLY_INTERVAL to prevent tight loops
- * when CPM has no proxy hosts configured (the check would always show
- * the section missing, but we still limit frequency).
- */
-async function reapplyIfSectionMissing(): Promise<void> {
-  const now = Date.now();
-  if (now - lastReapplyTime < MIN_REAPPLY_INTERVAL) return;
-
-  try {
-    // Probe the CPM-owned server section — 404 = missing (reloaded/restarted)
-    const response = await caddyRequest(
-      `${config.caddyApiUrl}/config/apps/http/servers/cpm/`,
-      "GET"
-    );
-
-    if (response.status === 404) {
-      console.log(
-        "[CaddyMonitor] CPM config section missing — likely a Caddy reload. Reapplying merge..."
-      );
-      lastReapplyTime = now;
-      await applyCaddyConfig();
-      console.log("[CaddyMonitor] Merge re-applied successfully after reload");
-    }
-  } catch (error) {
-    console.warn("[CaddyMonitor] Failed to check CPM config section:", error);
   }
 }
 

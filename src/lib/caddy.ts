@@ -2441,6 +2441,62 @@ export function caddyRequest(url: string, method: string, body?: string): Promis
   });
 }
 
+// ---------------------------------------------------------------------------
+// Config push ETag tracking — used by caddy-monitor to detect external reloads
+// ---------------------------------------------------------------------------
+
+let lastPushEtag: string | null = null;
+
+/**
+ * Returns the ETag captured after the most recent CPM config push.
+ * Used by caddy-monitor to distinguish CPM-initiated config changes from
+ * external ones (e.g. `caddy reload`). null means no push has completed yet.
+ */
+export function getLastPushEtag(): string | null {
+  return lastPushEtag;
+}
+
+/**
+ * Lightweight fetch of the current Caddy config ETag from the admin API.
+ * Only reads headers — the response body is discarded.
+ */
+async function fetchConfigEtag(): Promise<string | null> {
+  try {
+    const parsed = new URL(`${config.caddyApiUrl}/config/`);
+    const lib = parsed.protocol === "https:" ? https : http;
+    return await new Promise<string | null>((resolve) => {
+      const req = lib.request(
+        { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname, method: "GET" },
+        (res) => {
+          res.resume(); // discard body, free connection
+          resolve(res.headers.etag ?? null);
+        }
+      );
+      req.setTimeout(3000, () => {
+        req.destroy();
+        resolve(null);
+      });
+      req.on("error", () => resolve(null));
+      req.end();
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Helper: store the current config ETag after a successful CPM config push.
+ * Makes a best-effort attempt — failures are silently ignored.
+ */
+async function recordPushEtag(): Promise<void> {
+  try {
+    const etag = await fetchConfigEtag();
+    if (etag) lastPushEtag = etag;
+  } catch {
+    // Non-critical — monitor degrades gracefully without ETag tracking
+  }
+}
+
 export async function applyCaddyConfig() {
   const document = await buildCaddyDocument();
 
@@ -2452,6 +2508,7 @@ export async function applyCaddyConfig() {
     try {
       await applyCaddyConfigMerge(document);
       await syncInstances();
+      await recordPushEtag();
     } catch (error) {
       console.error("Failed to apply Caddy config (merge mode)", error);
 
@@ -2484,6 +2541,7 @@ export async function applyCaddyConfig() {
     }
 
     await syncInstances();
+    await recordPushEtag();
   } catch (error) {
     console.error("Failed to apply Caddy config", error);
 
