@@ -28,9 +28,12 @@ options, and advanced routing while CPM manages only its proxy host entries.
 └──────────────────────────────────────────┘
 ```
 
-**How it works:** CPM reads the current running Caddy config via `GET /config/`,
-merges only its managed sections (proxy hosts, TLS, L4, logging) into it, and
-applies the result. Your custom Caddyfile entries are preserved untouched.
+**How it works:** CPM parses your Caddyfile via `caddy adapt --config <path>`
+to get a clean JSON base (no CPM history), merges only its managed sections
+(proxy hosts, L4, logging) into it, and applies the result. Your custom
+Caddyfile entries are preserved untouched. If the `caddy` binary or Caddyfile
+is unavailable, CPM falls back to reading the running config via the Caddy
+admin API.
 
 ---
 
@@ -154,6 +157,7 @@ ADMIN_PASSWORD=Your-Str0ng-P@ssw0rd!
 BASE_URL=http://localhost:3000
 CADDY_API_URL=http://localhost:2019
 CADDY_CONFIG_MODE=merge
+CADDYFILE_PATH=/etc/caddy/Caddyfile
 FORWARD_AUTH_INTERNAL_URL=http://localhost:3000
 DATABASE_URL=file:/var/lib/cpm/caddy-proxy-manager.db
 ```
@@ -208,6 +212,15 @@ You should see at minimum two server keys:
 - **`cpm`** — managed by CPM (proxy hosts)
 - **`srv0`** (or similar) — from your Caddyfile (custom sites)
 
+You can also verify that CPM is reading your Caddyfile by checking the logs:
+
+```bash
+sudo journalctl -u cpm.service --since "10 minutes ago" | grep "caddy-merge"
+```
+
+Look for `[caddy-merge] Using caddy adapt for clean base config` to confirm
+it's using the Caddyfile adapt approach.
+
 ---
 
 ## Upgrading CPM
@@ -246,10 +259,23 @@ grep CADDY_CONFIG_MODE /etc/cpm/cpm.env
 
 ### Config merge fails silently
 
-Enable verbose logging in CPM by checking the journal:
+Check which config source CPM is using:
 
 ```bash
 sudo journalctl -u cpm.service --since "10 minutes ago" | grep -i "caddy-merge"
+```
+
+Look for:
+- `[caddy-merge] Using caddy adapt for clean base config` — successfully reading via Caddyfile
+- `[caddy-merge] Falling back to Caddy admin API for base config` — caddy adapt failed
+- `[caddy-merge] caddy adapt failed for ...` — specific failure reason
+
+If CPM is falling back to the API, verify `CADDYFILE_PATH` points to your
+Caddyfile and that `caddy` is in the PATH for the `cpm` system user:
+
+```bash
+sudo -u cpm which caddy
+sudo -u cpm caddy adapt --config /etc/caddy/Caddyfile --adapter caddyfile
 ```
 
 ---
@@ -260,23 +286,28 @@ sudo journalctl -u cpm.service --since "10 minutes ago" | grep -i "caddy-merge"
 File: /etc/caddy/Caddyfile          File: CPM buildCaddyDocument()
 ┌─────────────────────────┐         ┌──────────────────────────┐
 │ Global options          │         │ apps.http.servers.cpm    │
-│ Admin endpoint          │         │ apps.tls                 │
-│ Custom server blocks    │         │ apps.layer4              │
-│ Custom logging          │         │ apps.logging.logs        │
-└─────────┬───────────────┘         └───────────┬──────────────┘
-          │                                      │
-          └──────────────┬───────────────────────┘
-                         │
-                    ┌────▼─────┐
-                    │  MERGE   │  caddy-merge.ts
-                    └────┬─────┘
-                         │
-                    ┌────▼─────┐
-                    │ POST     │
-                    │ /load    │
-                    └──────────┘
+│ Admin endpoint          │         │ apps.layer4              │
+│ Custom server blocks    │         │ apps.logging.logs        │
+│ Custom TLS / certs     │         │                          │
+└──────────┬──────────────┘         └───────────┬──────────────┘
+           │        ▲                            │
+           │        │ caddy adapt                │
+           │        │ (clean JSON)               │
+           └────────┘                            │
+                    │                             │
+                    └──────────┬──────────────────┘
+                               │
+                          ┌────▼─────┐
+                          │  MERGE   │  caddy-merge.ts
+                          └────┬─────┘
+                               │
+                          ┌────▼─────┐
+                          │ POST     │
+                          │ /load    │
+                          └──────────┘
 ```
 
-CPM owns exactly four sections of the Caddy config. Everything else in your
-Caddyfile is safe. Upstream updates to CPM that add new config sections can be
-supported by extending the merge list in `caddy-merge.ts`.
+CPM reads your Caddyfile via `caddy adapt --config <path>` for a clean base
+config, then merges its managed sections in. CPM owns exactly `apps.http.servers.cpm`,
+`apps.layer4`, and `apps.logging.logs`. The `apps.tls` section is NOT owned by CPM —
+your Caddyfile's TLS configuration is always preserved. Everything else is safe.

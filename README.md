@@ -30,15 +30,22 @@ fork introduces a read-merge-write mode:
 CADDY_CONFIG_MODE=merge
 ```
 
-When enabled, CPM reads the current running config via `GET /config/`, merges
-only its managed sections into it, and applies the result. Your custom Caddyfile
-entries (global options, non-CPM sites, custom TLS config) are preserved.
+When enabled, CPM reads your Caddyfile via `caddy adapt --config <path>` to get
+a clean JSON base (no CPM history), merges only its managed sections into it,
+and applies the result. Your custom Caddyfile entries (global options, non-CPM
+sites, custom TLS config) are preserved untouched.
 
-**CPM owns exactly four config paths:**
+If the `caddy` binary or Caddyfile is unavailable, CPM falls back to reading
+the running config via the Caddy admin API (`GET /config/`).
+
+**CPM owns exactly these config paths:**
 - `apps.http.servers.cpm` — reverse proxy hosts
-- `apps.tls` — certificate automation + loaded PEMs
 - `apps.layer4` — L4 TCP/UDP proxy servers
 - `apps.logging.logs` — WAF rules logger + HTTP access logger
+
+`apps.tls` is intentionally NOT in the owned set — users may have their own TLS
+configuration in their Caddyfile (certificates, ACME settings) that must never
+be auto-removed.
 
 Everything else is left untouched. The merge logic lives in
 [`src/lib/caddy-merge.ts`](src/lib/caddy-merge.ts) — new file, zero changes to
@@ -59,8 +66,8 @@ All changes are:
 - **Isolated** — Proxmox scripts live in `deploy/proxmox/`, documentation in `docs/`
 
 Merging upstream updates: `git merge upstream/main` should produce no conflicts
-in the modified files. If upstream adds new config sections, extend the merge
-list in `caddy-merge.ts`.
+in the modified files. The merge logic is fully dynamic (reflection-based) so
+new upstream config sections are picked up automatically.
 
 ---
 
