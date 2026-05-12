@@ -6,13 +6,34 @@
  * merges CPM-managed sections into it, and POSTs the merged result.
  * This preserves user-defined Caddyfile entries that live outside CPM's managed sections.
  *
- * Managed sections (CPM owns these):
- *   - apps.http.servers.cpm  — CPM's HTTP reverse proxy server block
- *   - apps.tls               — certificate automation + loaded PEMs
- *   - apps.layer4             — L4 (TCP/UDP) proxy servers
- *   - apps.logging.logs      — WAF rules logger + HTTP access logger (merged)
+ * ## Reflection-based merge
  *
- * Everything else in the config is preserved as-is.
+ * Instead of hardcoding specific config paths (apps.http.servers.cpm, apps.tls, etc.),
+ * this module walks the cpmDocument tree recursively and dynamically discovers what
+ * to merge. The recursion skips only the `admin` root key (user's Caddyfile owns it).
+ *
+ * For each key in cpmDocument at each level:
+ *   - If both currentConfig and cpmDocument have objects → recurse deeper
+ *   - Otherwise → replace with CPM's value
+ *
+ * Keys in currentConfig that don't exist in cpmDocument are PRESERVED.
+ * This means any new section upstream CPM adds is automatically picked up.
+ *
+ * ## Stale cleanup
+ *
+ * CPM may have previously written to a path that it no longer produces (e.g., no
+ * proxy hosts → no servers.cpm). A deep-only merge would leave the old entry
+ * lingering. A minimal set of "owned leaf paths" is maintained for this purpose.
+ *
+ * When the value at an owned leaf path is absent from cpmDocument, it is removed
+ * from the merged config. This set is small and stable — it covers the paths that
+ * CPM definitely owns and can safely vacate.
+ *
+ *   - apps.http.servers.cpm  — CPM's reverse proxy server block
+ *   - apps.tls               — certificate automation + imported PEMs
+ *   - apps.layer4             — L4 TCP/UDP proxy servers
+ *
+ * The merge INCLUSION is fully dynamic. Only the DELETION set is enumerated.
  */
 import { config } from "./config";
 import http from "node:http";
@@ -60,36 +81,15 @@ function caddyApiRequest(
 }
 
 // ---------------------------------------------------------------------------
-// Deep object helpers (avoid mutating the current config)
+// Deep object helpers
 // ---------------------------------------------------------------------------
 
 function deepClone<T>(value: T): T {
   return JSON.parse(JSON.stringify(value));
 }
 
-/**
- * Set a value at a dotted path inside an object, creating intermediate
- * objects as needed. Mutates the input object.
- */
-function deepSet(
-  obj: Record<string, unknown>,
-  path: string[],
-  value: unknown
-): void {
-  let current = obj;
-  for (let i = 0; i < path.length - 1; i++) {
-    const key = path[i];
-    if (!(key in current) || typeof current[key] !== "object" || current[key] === null) {
-      current[key] = {};
-    }
-    current = current[key] as Record<string, unknown>;
-  }
-  const lastKey = path[path.length - 1];
-  if (value === undefined) {
-    delete current[lastKey];
-  } else {
-    current[lastKey] = value;
-  }
+function isObject(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
 /**
@@ -102,17 +102,26 @@ function deepGet(
 ): unknown {
   let current: unknown = obj;
   for (const key of path) {
-    if (
-      current === null ||
-      current === undefined ||
-      typeof current !== "object"
-    ) {
-      return undefined;
-    }
-    current = (current as Record<string, unknown>)[key];
+    if (!isObject(current)) return undefined;
+    current = current[key];
   }
   return current;
 }
+
+// ---------------------------------------------------------------------------
+// Owned leaf paths — stale cleanup entries
+// ---------------------------------------------------------------------------
+
+/**
+ * Paths that CPM definitely owns and should be removed from the merged config
+ * when absent from cpmDocument. Without this, a deep-only merge would leave
+ * old CPM entries lingering after the user deletes the corresponding resource.
+ */
+const OWNED_LEAF_PATHS: string[][] = [
+  ["apps", "http", "servers", "cpm"],
+  ["apps", "tls"],
+  ["apps", "layer4"],
+];
 
 // ---------------------------------------------------------------------------
 // Read current running Caddy config
@@ -145,11 +154,79 @@ async function readCurrentCaddyConfig(): Promise<Record<string, unknown> | null>
 }
 
 // ---------------------------------------------------------------------------
-// Merge CPM-managed sections into an existing config
+// Dynamic reflection-based merge
+// ---------------------------------------------------------------------------
+
+/**
+ * Recursively merge `source` into `target`, reflecting on the structure of
+ * `source` to determine what to merge.
+ *
+ * Rules per key at each depth:
+ *   - `admin` is skipped at root depth (user's Caddyfile owns admin endpoint)
+ *   - Both are objects → recurse deeper (preserves sibling keys in target)
+ *   - Otherwise → replace with `source`'s value (CPM's configuration wins)
+ *
+ * Keys that exist in `target` but NOT in `source` are preserved untouched.
+ * This ensures user-defined Caddyfile entries survive the merge.
+ */
+function reflectMerge(
+  target: Record<string, unknown>,
+  source: Record<string, unknown>,
+  depth: number
+): void {
+  for (const [key, srcVal] of Object.entries(source)) {
+    // Skip admin at root — user's Caddyfile controls the admin endpoint
+    if (depth === 0 && key === "admin") continue;
+
+    const tgtVal = target[key];
+
+    if (isObject(srcVal) && isObject(tgtVal)) {
+      // Both sides have objects — recurse to preserve sibling keys
+      reflectMerge(tgtVal, srcVal, depth + 1);
+    } else if (srcVal !== undefined) {
+      // Leaf value or type mismatch — CPM's version wins
+      target[key] = deepClone(srcVal);
+    }
+  }
+}
+
+/**
+ * Remove stale CPM entries from the merged config.
+ *
+ * For each OWNED_LEAF_PATH: if the value is present in `merged` but absent
+ * from `cpmDocument`, CPM no longer manages this resource. Delete it so
+ * stale routes/configs don't linger in Caddy.
+ */
+function removeStaleOwnedLeaves(
+  merged: Record<string, unknown>,
+  cpmDocument: Record<string, unknown>
+): void {
+  for (const path of OWNED_LEAF_PATHS) {
+    if (deepGet(cpmDocument, path) !== undefined) continue; // CPM still manages this
+
+    const key = path[path.length - 1];
+    const parentPath = path.slice(0, -1);
+    const parent = deepGet(merged, parentPath) as
+      | Record<string, unknown>
+      | undefined;
+
+    if (parent && key in parent) {
+      delete parent[key];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Merge CPM's sections into the current running config.
+ *
+ * Strategy:
+ *   1. Deep-clone currentConfig to avoid mutation
+ *   2. Reflect-merge cpmDocument into the clone (dynamic tree walk)
+ *   3. Remove stale entries from OWNED_LEAF_PATHS
  *
  * @param currentConfig  The config read from Caddy's GET /config/
  * @param cpmDocument    The config built by buildCaddyDocument()
@@ -159,82 +236,17 @@ export function mergeCpmSections(
   currentConfig: Record<string, unknown>,
   cpmDocument: Record<string, unknown>
 ): Record<string, unknown> {
-  // Deep clone so we never mutate the argument
   const merged = deepClone(currentConfig);
 
-  // 1. apps.http.servers.cpm — CPM's HTTP server block
-  const cpmServer = deepGet(cpmDocument, ["apps", "http", "servers", "cpm"]);
-  if (cpmServer !== undefined) {
-    deepSet(merged, ["apps", "http", "servers", "cpm"], deepClone(cpmServer));
-  } else {
-    // CPM has no proxy hosts — remove the cpm server block if it exists
-    const servers = deepGet(merged, ["apps", "http", "servers"]) as
-      | Record<string, unknown>
-      | undefined;
-    if (servers && "cpm" in servers) {
-      delete servers.cpm;
-    }
-  }
+  // Phase 1: Dynamic reflection merge — walks cpmDocument tree and merges
+  // every key (except admin) into the cloned currentConfig. Keys in
+  // currentConfig that don't appear in cpmDocument are preserved.
+  reflectMerge(merged, cpmDocument, 0);
 
-  // 2. apps.tls — certificate automation + loaded PEMs
-  const tlsSection = deepGet(cpmDocument, ["apps", "tls"]);
-  if (tlsSection !== undefined) {
-    deepSet(merged, ["apps", "tls"], deepClone(tlsSection));
-  } else {
-    // Remove CPM-managed TLS if present
-    const apps = deepGet(merged, ["apps"]) as
-      | Record<string, unknown>
-      | undefined;
-    if (apps && "tls" in apps) {
-      delete apps.tls;
-    }
-  }
-
-  // 3. apps.layer4 — L4 TCP/UDP proxy servers
-  const l4Section = deepGet(cpmDocument, ["apps", "layer4"]);
-  if (l4Section !== undefined) {
-    deepSet(merged, ["apps", "layer4"], deepClone(l4Section));
-  } else {
-    const apps = deepGet(merged, ["apps"]) as
-      | Record<string, unknown>
-      | undefined;
-    if (apps && "layer4" in apps) {
-      delete apps.layer4;
-    }
-  }
-
-  // 4. apps.logging.logs — merge CPM's loggers into existing
-  //    CPM manages two named loggers: "waf_rules" and "http_access".
-  //    We shallow-merge these specific keys so the user's other loggers
-  //    (if any) are preserved.
-  const cpmLogs = deepGet(cpmDocument, ["logging", "logs"]) as
-    | Record<string, unknown>
-    | undefined;
-  if (cpmLogs && typeof cpmLogs === "object") {
-    // Ensure target path exists
-    let targetLogs = deepGet(merged, ["logging", "logs"]) as
-      | Record<string, unknown>
-      | undefined;
-    if (!targetLogs) {
-      targetLogs = {};
-      deepSet(merged, ["logging", "logs"], targetLogs);
-    }
-    // Merge each logger from CPM
-    for (const [loggerName, loggerConfig] of Object.entries(cpmLogs)) {
-      if (loggerConfig !== undefined && loggerConfig !== null) {
-        targetLogs[loggerName] = deepClone(
-          loggerConfig as Record<string, unknown>
-        );
-      } else {
-        // CPM explicitly disabled this logger — remove it
-        delete targetLogs[loggerName];
-      }
-    }
-  }
-
-  // 5. Admin config — intentionally NOT merged.
-  //    The user's Caddyfile owns the admin endpoint config.
-  //    We leave whatever is in the running config untouched.
+  // Phase 2: Remove stale entries that CPM no longer produces.
+  // Without this, owned paths (servers.cpm, tls, layer4) would linger after
+  // the user deletes the corresponding CPM resource.
+  removeStaleOwnedLeaves(merged, cpmDocument);
 
   return merged;
 }
@@ -245,9 +257,9 @@ export function mergeCpmSections(
 
 /**
  * Apply Caddy config in merge mode:
- * 1. Read current running config
- * 2. Merge CPM's managed sections into it
- * 3. POST the merged result
+ *   1. Read current running config
+ *   2. Merge CPM's managed sections into it
+ *   3. POST the merged result
  *
  * If reading the current config fails (Caddy not running), falls back to
  * a full POST /load with just the CPM document as a bootstrap.
@@ -262,9 +274,7 @@ export async function applyCaddyConfigMerge(
   if (currentConfig) {
     const merged = mergeCpmSections(currentConfig, cpmDocument);
     payload = JSON.stringify(merged);
-    console.log(
-      "[caddy-merge] Merged CPM config into running config"
-    );
+    console.log("[caddy-merge] Merged CPM config into running config");
   } else {
     // Caddy not reachable — bootstrap with CPM's full document
     payload = JSON.stringify(cpmDocument);
