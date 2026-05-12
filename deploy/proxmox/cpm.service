@@ -1,0 +1,27 @@
+[Unit]
+Description=Caddy Proxy Manager - web UI for managing Caddy reverse proxies
+Documentation=https://github.com/fuomag9/caddy-proxy-manager
+After=network.target caddy.service
+Wants=caddy.service
+
+[Service]
+Type=simple
+User=cpm
+Group=cpm
+EnvironmentFile=/etc/cpm/cpm.env
+WorkingDirectory=/opt/cpm
+ExecStart=/opt/cpm/server.js
+Restart=on-failure
+RestartSec=10
+LimitNOFILE=65536
+
+# Hardening
+NoNewPrivileges=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/var/lib/cpm /var/log/cpm
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target
