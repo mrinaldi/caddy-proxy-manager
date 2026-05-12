@@ -56,6 +56,7 @@ import { buildClientAuthentication, groupMtlsDomainsByCaSet, buildMtlsRbacSubrou
 import { buildRoleFingerprintMap, buildCertFingerprintMap, buildRoleCertIdMap } from "./models/mtls-roles";
 import { getAccessRulesForHosts } from "./models/mtls-access-rules";
 import { buildWafHandler, resolveEffectiveWaf } from "./caddy-waf";
+import { applyCaddyConfigMerge } from "./caddy-merge";
 
 const CERTS_DIR = process.env.CERTS_DIRECTORY || join(process.cwd(), "data", "certs");
 mkdirSync(CERTS_DIR, { recursive: true, mode: 0o700 });
@@ -2414,7 +2415,7 @@ async function buildCaddyDocument() {
  * Avoids browser-security headers (Sec-Fetch-*) that native fetch sends,
  * which would trigger Caddy's CORS origin enforcement.
  */
-function caddyRequest(url: string, method: string, body?: string): Promise<{ status: number; text: string }> {
+export function caddyRequest(url: string, method: string, body?: string): Promise<{ status: number; text: string }> {
   return new Promise((resolve, reject) => {
     const parsed = new URL(url);
     const lib = parsed.protocol === "https:" ? https : http;
@@ -2442,6 +2443,35 @@ function caddyRequest(url: string, method: string, body?: string): Promise<{ sta
 
 export async function applyCaddyConfig() {
   const document = await buildCaddyDocument();
+
+  // Merge mode: read current config, merge CPM sections, apply
+  if (config.caddyConfigMode === "merge") {
+    const hash = crypto.createHash("sha256").update(JSON.stringify(document)).digest("hex");
+    setSetting("caddy_config_hash", { hash, updatedAt: nowIso() });
+
+    try {
+      await applyCaddyConfigMerge(document);
+      await syncInstances();
+    } catch (error) {
+      console.error("Failed to apply Caddy config (merge mode)", error);
+
+      const err = error as { cause?: NodeJS.ErrnoException };
+      const causeCode = err?.cause?.code;
+
+      if (causeCode === "ENOTFOUND" || causeCode === "ECONNREFUSED") {
+        throw new Error(
+          `Unable to reach Caddy API at ${config.caddyApiUrl}. Ensure Caddy is running and accessible.`,
+          { cause: error }
+        );
+      }
+
+      throw error;
+    }
+
+    return;
+  }
+
+  // Replace mode (default): full POST /load
   const payload = JSON.stringify(document);
   const hash = crypto.createHash("sha256").update(payload).digest("hex");
   setSetting("caddy_config_hash", { hash, updatedAt: nowIso() });
