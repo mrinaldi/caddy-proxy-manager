@@ -160,6 +160,7 @@ export const config = {
     return getSessionSecret();
   },
   caddyApiUrl: process.env.CADDY_API_URL ?? DEFAULT_CADDY_URL,
+  caddyConfigMode: (process.env.CADDY_CONFIG_MODE ?? "replace") as "replace" | "merge",
   baseUrl: process.env.BASE_URL ?? "http://localhost:3000",
   get adminUsername() {
     return getAdminCredentials().username;
