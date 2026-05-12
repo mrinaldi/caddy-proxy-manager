@@ -2,9 +2,22 @@
  * Caddy config merge mechanism.
  *
  * Supports CADDY_CONFIG_MODE=merge:
- * Instead of POST /load (full replacement), reads the current running Caddy config,
- * merges CPM-managed sections into it, and POSTs the merged result.
- * This preserves user-defined Caddyfile entries that live outside CPM's managed sections.
+ * Instead of POST /load (full replacement), reads the user's Caddyfile (via
+ * `caddy adapt`), merges CPM-managed sections into it, and POSTs the merged
+ * result. This preserves user-defined Caddyfile entries that live outside
+ * CPM's managed sections.
+ *
+ * ## Config source: caddyfile adapt (two-phase)
+ *
+ *   1. **caddy adapt** (primary) — runs `caddy adapt --config <Caddyfile>` to
+ *      produce a clean JSON base config containing ONLY the user's Caddyfile
+ *      entries. No CPM history, no stale entries from previous merges.
+ *   2. **Admin API** (fallback) — if the `caddy` binary or Caddyfile is
+ *      unavailable, falls back to `GET /config/` on the running Caddy instance.
+ *
+ * The adapt approach eliminates stale-entry concerns because the Caddyfile is
+ * never modified by CPM — so there's nothing to clean up. The fallback retains
+ * the stale cleanup safety net.
  *
  * ## Reflection-based merge
  *
@@ -19,25 +32,24 @@
  * Keys in currentConfig that don't exist in cpmDocument are PRESERVED.
  * This means any new section upstream CPM adds is automatically picked up.
  *
- * ## Stale cleanup
+ * ## Stale cleanup (API fallback only)
  *
- * CPM may have previously written to a path that it no longer produces (e.g., no
- * proxy hosts → no servers.cpm). A deep-only merge would leave the old entry
- * lingering. A minimal set of "owned leaf paths" is maintained for this purpose.
- *
- * When the value at an owned leaf path is absent from cpmDocument, it is removed
- * from the merged config. This set is small and stable — it covers the paths that
- * CPM definitely owns and can safely vacate.
+ * When falling back to the admin API, CPM may have previously written to a path
+ * that it no longer produces (e.g., no proxy hosts → no servers.cpm). A minimal
+ * set of "owned leaf paths" is maintained for this purpose.
  *
  *   - apps.http.servers.cpm  — CPM's reverse proxy server block
- *   - apps.tls               — certificate automation + imported PEMs
  *   - apps.layer4             — L4 TCP/UDP proxy servers
+ *
+ * Note: `apps.tls` is NOT in the cleanup set — users may have their own TLS
+ * configuration in their Caddyfile that must never be auto-removed.
  *
  * The merge INCLUSION is fully dynamic. Only the DELETION set is enumerated.
  */
 import { config } from "./config";
 import http from "node:http";
 import https from "node:https";
+import { execSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Caddy Admin API request (mirrors caddyRequest in caddy.ts)
@@ -116,22 +128,85 @@ function deepGet(
  * Paths that CPM definitely owns and should be removed from the merged config
  * when absent from cpmDocument. Without this, a deep-only merge would leave
  * old CPM entries lingering after the user deletes the corresponding resource.
+ *
+ * Note: `apps.tls` is intentionally excluded — users may have their own TLS
+ * configuration in their Caddyfile (certificates, ACME settings, etc.) and
+ * CPM does not exclusively own the entire `apps.tls` object.
+ *
+ * With the caddyfile adapt approach this cleanup is mostly a safety net:
+ * since the Caddyfile base is always clean (no CPM history), stale entries
+ * should not occur. The cleanup is kept for the API fallback case.
  */
 const OWNED_LEAF_PATHS: string[][] = [
   ["apps", "http", "servers", "cpm"],
-  ["apps", "tls"],
   ["apps", "layer4"],
 ];
 
 // ---------------------------------------------------------------------------
-// Read current running Caddy config
+// Caddyfile adapt — parse the user's Caddyfile to a clean JSON base
 // ---------------------------------------------------------------------------
 
 /**
- * Fetches the full running Caddy config via GET /config/.
- * Returns null if Caddy is unreachable.
+ * Parses the user's Caddyfile via `caddy adapt --config <path>`.
+ *
+ * This gives a clean base config that contains ONLY what the user wrote in
+ * their Caddyfile — no CPM history, no stale entries from previous merges.
+ *
+ * Returns the parsed JSON config, or null if the caddy binary / Caddyfile
+ * is unavailable or the Caddyfile has parse errors (caller falls back to API).
+ */
+function adaptCaddyfile(): Record<string, unknown> | null {
+  const caddyfilePath = config.caddyfilePath;
+  try {
+    const stdout = execSync(
+      `caddy adapt --config "${caddyfilePath}" --adapter caddyfile`,
+      { encoding: "utf-8", timeout: 15000 }
+    );
+    const parsed = JSON.parse(stdout);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      console.warn(
+        `[caddy-merge] caddy adapt returned unexpected type: ${typeof parsed}`
+      );
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    console.warn(
+      `[caddy-merge] caddy adapt failed for ${caddyfilePath}, falling back to API:`,
+      error
+    );
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Read base config — adapt or fall back to admin API
+// ---------------------------------------------------------------------------
+
+/**
+ * Reads the base Caddy config for merging.
+ *
+ * Strategy (two-phase):
+ *   1. Try `caddy adapt --config <Caddyfile>` — returns a CLEAN base config
+ *      that contains only the user's Caddyfile entries (no CPM history).
+ *   2. If caddy adapt fails (binary not found, Caddyfile missing/parse error,
+ *      etc.), fall back to GET /config/ via the admin API.
+ *
+ * The adapt approach eliminates stale-entry concerns entirely because the
+ * Caddyfile is never modified by CPM — so there's nothing to clean up.
  */
 async function readCurrentCaddyConfig(): Promise<Record<string, unknown> | null> {
+  // Phase 1: Try caddy adapt for a clean base config
+  const adapted = adaptCaddyfile();
+  if (adapted) {
+    console.log("[caddy-merge] Using caddy adapt for clean base config");
+    return adapted;
+  }
+
+  // Phase 2: Fall back to the running Caddy config via admin API
+  console.warn(
+    "[caddy-merge] Falling back to Caddy admin API for base config"
+  );
   try {
     const response = await caddyApiRequest(
       `${config.caddyApiUrl}/config/`,
@@ -257,12 +332,13 @@ export function mergeCpmSections(
 
 /**
  * Apply Caddy config in merge mode:
- *   1. Read current running config
+ *   1. Read base config (caddy adapt → Caddyfile, or API fallback)
  *   2. Merge CPM's managed sections into it
  *   3. POST the merged result
  *
- * If reading the current config fails (Caddy not running), falls back to
- * a full POST /load with just the CPM document as a bootstrap.
+ * If obtaining a base config fails (caddy binary unavailable AND Caddy not
+ * running), falls back to a full POST /load with just the CPM document as a
+ * bootstrap.
  */
 export async function applyCaddyConfigMerge(
   cpmDocument: Record<string, unknown>
