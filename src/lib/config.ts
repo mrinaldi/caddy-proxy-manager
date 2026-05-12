@@ -161,6 +161,7 @@ export const config = {
   },
   caddyApiUrl: process.env.CADDY_API_URL ?? DEFAULT_CADDY_URL,
   caddyConfigMode: (process.env.CADDY_CONFIG_MODE ?? "replace") as "replace" | "merge",
+  caddyfilePath: process.env.CADDYFILE_PATH ?? "/etc/caddy/Caddyfile",
   baseUrl: process.env.BASE_URL ?? "http://localhost:3000",
   get adminUsername() {
     return getAdminCredentials().username;
