@@ -30,6 +30,27 @@ Access at `http://localhost:3000/login`
 
 Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, caddy-logs).
 
+### Proxmox / Non-Docker Deployment
+
+CPM can also run directly on a Proxmox LXC container (or any Linux host)
+alongside a standard Caddy installation. This lets you maintain your own
+Caddyfile with custom sites while CPM manages only its proxy host entries.
+
+Key differences from the Docker setup:
+
+| Docker | Proxmox |
+|--------|---------|
+| `CADDY_API_URL=http://caddy:2019` | `CADDY_API_URL=http://localhost:2019` |
+| Full `POST /load` replacement | `CADDY_CONFIG_MODE=merge` preserves user Caddyfile |
+| Docker Compose manages services | systemd manages services |
+| Container networking | Localhost communication |
+
+**Use `CADDY_CONFIG_MODE=merge`** — CPM reads the running config, merges only
+its managed sections (proxy hosts, TLS, L4, logging), and preserves everything
+else. Without this flag, CPM replaces the entire Caddy config on every change.
+
+See [`docs/proxmox-deployment.md`](docs/proxmox-deployment.md) for the full guide.
+
 ---
 
 ## Features
@@ -75,6 +96,7 @@ Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, c
 | `ADMIN_PASSWORD` | Admin password (see requirements below) | `admin` (dev only) | **Yes** |
 | `BASE_URL` | Public URL where users access the dashboard.<br/>**Required for OAuth** - must match redirect URI | `http://localhost:3000` | **Yes** (if using OAuth) |
 | `CADDY_API_URL` | Caddy Admin API endpoint | `http://caddy:2019` (prod)<br/>`http://localhost:2019` (dev) | No |
+| `CADDY_CONFIG_MODE` | Config application mode: `replace` (full POST /load) or `merge` (preserve user Caddyfile entries) | `replace` | No |
 | `DATABASE_URL` | SQLite database URL | `file:/app/data/caddy-proxy-manager.db` | No |
 | `CERTS_DIRECTORY` | Certificate storage directory | `./data/certs` | No |
 | `LOGIN_MAX_ATTEMPTS` | Max login attempts before rate limit | `5` | No |
