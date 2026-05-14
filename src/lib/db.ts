@@ -254,6 +254,25 @@ function patchTablesForMigration020() {
   renameColumnIfNeeded("verifications", "updated_at", "updatedAt");
 }
 
+/**
+ * Walk the cause chain of an error to find the root cause.
+ * DrizzleError wraps SQLiteError in `cause`, and SQLiteError sometimes wraps
+ * another SQLiteError, so traverse until we hit the bottom.
+ */
+function rootCauseMessage(error: unknown): { message: string; code?: string } {
+  let current = error;
+  while (current && typeof current === "object" && "cause" in current) {
+    current = (current as { cause: unknown }).cause;
+  }
+  if (current && typeof current === "object" && "message" in current) {
+    return {
+      message: (current as { message: string }).message,
+      code: "code" in current ? (current as { code: string }).code : undefined,
+    };
+  }
+  return { message: String(current ?? "") };
+}
+
 function runMigrations() {
   if (sqlitePath === ":memory:") {
     return;
@@ -268,15 +287,8 @@ function runMigrations() {
   } catch (error: unknown) {
     // During build, pages may be pre-rendered in parallel, causing race conditions
     // with migrations. If tables already exist, just continue.
-    if (
-      typeof error === "object" &&
-      error !== null &&
-      "code" in error &&
-      "message" in error &&
-      error.code === "SQLITE_ERROR" &&
-      typeof error.message === "string" &&
-      error.message.includes("already exists")
-    ) {
+    const root = rootCauseMessage(error);
+    if (root.code === "SQLITE_ERROR" && root.message.includes("already exists")) {
       console.log('Database tables already exist, skipping migrations');
       globalForDrizzle.__MIGRATIONS_RAN__ = true;
       return;
