@@ -2466,7 +2466,7 @@ async function fetchConfigEtag(): Promise<string | null> {
     const lib = parsed.protocol === "https:" ? https : http;
     return await new Promise<string | null>((resolve) => {
       const req = lib.request(
-        { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname, method: "GET" },
+        { hostname: parsed.hostname, port: parsed.port, path: parsed.pathname + parsed.search, method: "GET" },
         (res) => {
           res.resume(); // discard body, free connection
           resolve(res.headers.etag ?? null);

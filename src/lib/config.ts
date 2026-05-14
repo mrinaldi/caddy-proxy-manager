@@ -196,6 +196,13 @@ export function validateProductionConfig() {
     void config.adminUsername;
     void config.adminPassword;
   }
+
+  const mode = process.env.CADDY_CONFIG_MODE ?? "replace";
+  if (mode !== "replace" && mode !== "merge") {
+    throw new Error(
+      `Invalid CADDY_CONFIG_MODE: "${mode}". Must be "replace" or "merge".`
+    );
+  }
 }
 
 /**

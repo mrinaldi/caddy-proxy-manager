@@ -49,7 +49,7 @@
 import { config } from "./config";
 import http from "node:http";
 import https from "node:https";
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Caddy Admin API request (mirrors caddyRequest in caddy.ts)
@@ -158,10 +158,18 @@ const OWNED_LEAF_PATHS: string[][] = [
 function adaptCaddyfile(): Record<string, unknown> | null {
   const caddyfilePath = config.caddyfilePath;
   try {
-    const stdout = execSync(
-      `caddy adapt --config "${caddyfilePath}" --adapter caddyfile`,
+    const result = spawnSync(
+      "caddy",
+      ["adapt", "--config", caddyfilePath, "--adapter", "caddyfile"],
       { encoding: "utf-8", timeout: 15000 }
     );
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      throw new Error(
+        `caddy adapt exited with code ${result.status}: ${result.stderr}`
+      );
+    }
+    const stdout = result.stdout;
     const parsed = JSON.parse(stdout);
     if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
       console.warn(
