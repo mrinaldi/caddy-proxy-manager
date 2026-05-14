@@ -63,7 +63,14 @@ export const sqlite =
   globalForDrizzle.__SQLITE_CLIENT__ ??
   (() => {
     ensureDirectoryFor(sqlitePath);
-    return new Database(sqlitePath);
+    const conn = new Database(sqlitePath);
+    // WAL mode allows concurrent readers + serialized writes, which matters
+    // during next build when multiple workers evaluate modules simultaneously.
+    conn.run("PRAGMA journal_mode=WAL");
+    // Busy timeout: wait up to 5s for the lock instead of failing immediately
+    // with SQLITE_BUSY when another process/worker is mid-migration.
+    conn.run("PRAGMA busy_timeout=5000");
+    return conn;
   })();
 
 if (process.env.NODE_ENV !== "production") {
