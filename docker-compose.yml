@@ -58,6 +58,8 @@ services:
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-cpm}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-analytics}
+      # Days of analytics data to keep before TTL deletes it (default 30)
+      CLICKHOUSE_RETENTION_DAYS: ${CLICKHOUSE_RETENTION_DAYS:-30}
     group_add:
       - "${CADDY_GID:-10000}"  # caddy's GID — lets the web user read /logs/access.log
     volumes:
@@ -181,6 +183,11 @@ services:
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     volumes:
       - clickhouse-data:/var/lib/clickhouse
+      # Mount only our single override file, not the whole config.d directory.
+      # Bind-mounting the directory would shadow the image's docker_related_config.xml
+      # (which sets listen_host to ::/0.0.0.0), leaving ClickHouse bound to loopback
+      # only so the web container could no longer reach it.
+      - ./docker/clickhouse/config.d/low-disk-write.xml:/etc/clickhouse-server/config.d/low-disk-write.xml:ro
     networks:
       - caddy-network
     healthcheck:

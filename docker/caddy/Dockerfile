@@ -1,13 +1,21 @@
 # syntax=docker/dockerfile:1.6
 
-FROM golang:1.26 AS builder
+# Always run the builder on the host arch (BUILDPLATFORM) and let xcaddy
+# cross-compile Caddy for the target arch via GOOS/GOARCH. This avoids QEMU
+# emulation when producing the linux/arm64 image on an x86 GitHub runner —
+# native cross-compilation is several times faster.
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
 
 # Install xcaddy
 RUN go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
 
-# Build Caddy with plugins
-# GOPROXY=direct bypasses the module proxy cache so the latest commit is always fetched
-RUN GOPROXY=direct xcaddy build \
+# Build Caddy with plugins.
+# Track Caddy master until the v2.11.3 client TLS regression fix
+# (caddyserver/caddy#7724) is available in a stable release.
+RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build master \
     --with github.com/caddy-dns/cloudflare \
     --with github.com/caddy-dns/route53 \
     --with github.com/caddy-dns/digitalocean \
@@ -20,12 +28,13 @@ RUN GOPROXY=direct xcaddy build \
     --with github.com/caddy-dns/ovh \
     --with github.com/caddy-dns/ionos \
     --with github.com/caddy-dns/linode \
+    --with github.com/caddy-dns/njalla \
     --with github.com/mholt/caddy-l4 \
     --with github.com/fuomag9/caddy-blocker-plugin \
     --with github.com/corazawaf/coraza-caddy/v2 \
     --output /usr/bin/caddy
 
-FROM ubuntu:24.04
+FROM ubuntu:26.04
 
 # Accept build args for user/group IDs to support rootless operation
 # Using 10000 as default to avoid conflicts with system users

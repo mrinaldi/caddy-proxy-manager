@@ -5,8 +5,8 @@ import { requireAdmin } from "@/src/lib/auth";
 import { applyCaddyConfig } from "@/src/lib/caddy";
 import { getInstanceMode, getSlaveMasterToken, setInstanceMode, setSlaveMasterToken, syncInstances } from "@/src/lib/instance-sync";
 import { createInstance, deleteInstance, updateInstance } from "@/src/lib/models/instances";
-import { clearSetting, getSetting, saveCloudflareSettings, getDnsProviderSettings, saveDnsProviderSettings, saveGeneralSettings, saveAuthentikSettings, saveMetricsSettings, saveLoggingSettings, saveDnsSettings, saveUpstreamDnsResolutionSettings, saveGeoBlockSettings, saveWafSettings, getWafSettings } from "@/src/lib/settings";
-import { listProxyHosts, updateProxyHost } from "@/src/lib/models/proxy-hosts";
+import { clearSetting, getSetting, saveCloudflareSettings, getDnsProviderSettings, saveDnsProviderSettings, saveGeneralSettings, saveAuthentikSettings, saveMetricsSettings, saveLoggingSettings, saveDnsSettings, saveUpstreamDnsResolutionSettings, saveGeoBlockSettings, saveWafSettings, getWafSettings, saveErrorPagesSettings } from "@/src/lib/settings";
+import { listProxyHosts, updateProxyHost, sanitizeErrorPageRules } from "@/src/lib/models/proxy-hosts";
 import { getWafRuleMessages } from "@/src/lib/models/waf-events";
 import type { CloudflareSettings, DnsProviderSettings, GeoBlockSettings, WafSettings } from "@/src/lib/settings";
 import { getProviderDefinition, encryptProviderCredentials } from "@/src/lib/dns-providers";
@@ -716,6 +716,39 @@ export async function updateGeoBlockSettingsAction(_prevState: ActionResult | nu
   }
 }
 
+export async function updateErrorPagesSettingsAction(_prevState: ActionResult | null, formData: FormData): Promise<ActionResult> {
+  try {
+    await requireAdmin();
+
+    const raw = formData.get("errorPagesJson");
+    let rules: ReturnType<typeof sanitizeErrorPageRules> = [];
+    if (raw && typeof raw === "string") {
+      try {
+        rules = sanitizeErrorPageRules(JSON.parse(raw));
+      } catch {
+        return { success: false, message: "Invalid error pages payload" };
+      }
+    }
+
+    await saveErrorPagesSettings({ rules });
+
+    try {
+      await applyCaddyConfig();
+      revalidatePath("/settings");
+      return { success: true, message: "Error pages saved and applied successfully" };
+    } catch (error) {
+      console.error("Failed to apply Caddy config:", error);
+      revalidatePath("/settings");
+      const errorMsg = error instanceof Error ? error.message : "Unknown error";
+      await syncInstances();
+      return { success: true, message: `Settings saved, but could not apply to Caddy: ${errorMsg}` };
+    }
+  } catch (error) {
+    console.error("Failed to save error pages settings:", error);
+    return { success: false, message: error instanceof Error ? error.message : "Failed to save error pages settings" };
+  }
+}
+
 export async function syncSlaveInstancesAction(_prevState: ActionResult | null, _formData: FormData): Promise<ActionResult> {
   void _prevState;
   void _formData;
@@ -897,7 +930,8 @@ export async function suppressWafRuleForHostAction(ruleId: number, hostname: str
     const session = await requireAdmin();
     const userId = Number(session.user.id);
     const hosts = await listProxyHosts();
-    const host = hosts.find((h) => h.domains.includes(hostname));
+    const bareHostname = hostname.replace(/:\d+$/, "");
+    const host = hosts.find((h) => h.domains.includes(bareHostname));
     if (!host) {
       return { success: false, message: `No proxy host found for ${hostname}.` };
     }

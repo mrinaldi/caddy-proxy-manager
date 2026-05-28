@@ -64,6 +64,143 @@ describe('clickhouse client analytics enablement', () => {
     expect(createClient).not.toHaveBeenCalled();
   });
 
+  it('defaults retention to 30 days and creates tables with a 30-day TTL', async () => {
+    vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
+    vi.stubEnv('CLICKHOUSE_RETENTION_DAYS', '');
+
+    const commands: string[] = [];
+    const command = vi.fn(async ({ query }: { query: string }) => { commands.push(query); });
+    // ensureRetentionTtl reads the live TTL; report it already matches 30 days.
+    const query = vi.fn(async () => ({ json: async () => [{ create_table_query: 'TTL ts + toIntervalDay(30)' }] }));
+
+    vi.doMock('@clickhouse/client', () => ({
+      createClient: vi.fn(() => ({ query, command, insert: vi.fn(), close: vi.fn() })),
+    }));
+
+    const { getRetentionDays, initClickHouse } = await import('@/src/lib/clickhouse/client');
+    expect(getRetentionDays()).toBe(30);
+
+    await initClickHouse();
+
+    const trafficDdl = commands.find(q => q.includes('CREATE TABLE IF NOT EXISTS traffic_events'));
+    const wafDdl = commands.find(q => q.includes('CREATE TABLE IF NOT EXISTS waf_events'));
+    expect(trafficDdl).toContain('TTL ts + INTERVAL 30 DAY DELETE');
+    expect(wafDdl).toContain('TTL ts + INTERVAL 30 DAY DELETE');
+    // TTL already matches → no MODIFY TTL migration issued.
+    expect(commands.some(q => q.includes('MODIFY TTL'))).toBe(false);
+  });
+
+  it('honors a custom retention value and migrates an existing table whose TTL differs', async () => {
+    vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
+    vi.stubEnv('CLICKHOUSE_RETENTION_DAYS', '7');
+
+    const commands: string[] = [];
+    const command = vi.fn(async ({ query }: { query: string }) => { commands.push(query); });
+    // Existing tables were created under the old 90-day TTL.
+    const query = vi.fn(async () => ({ json: async () => [{ create_table_query: 'TTL ts + toIntervalDay(90)' }] }));
+
+    vi.doMock('@clickhouse/client', () => ({
+      createClient: vi.fn(() => ({ query, command, insert: vi.fn(), close: vi.fn() })),
+    }));
+
+    const { getRetentionDays, initClickHouse } = await import('@/src/lib/clickhouse/client');
+    expect(getRetentionDays()).toBe(7);
+
+    await initClickHouse();
+
+    expect(commands.find(q => q.includes('CREATE TABLE IF NOT EXISTS traffic_events')))
+      .toContain('TTL ts + INTERVAL 7 DAY DELETE');
+    const modifies = commands.filter(q => /ALTER TABLE \w+ MODIFY TTL ts \+ INTERVAL 7 DAY DELETE/.test(q));
+    expect(modifies).toHaveLength(2);
+  });
+
+  it('throws when CLICKHOUSE_RETENTION_DAYS is not a positive integer', async () => {
+    vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
+    vi.stubEnv('CLICKHOUSE_RETENTION_DAYS', 'not-a-number');
+    vi.doMock('@clickhouse/client', () => ({ createClient: vi.fn() }));
+
+    await expect(import('@/src/lib/clickhouse/client')).rejects.toThrow(/CLICKHOUSE_RETENTION_DAYS/);
+  });
+
+  // The drop step first enumerates matching tables from system.tables, then drops
+  // each. This mock answers the enumeration query with `liveTables` and every
+  // other query (the retention create_table_query read) with a matching 30-day TTL.
+  function mockClient(liveTables: string[], commandImpl?: (q: string) => void) {
+    const calls: { command: string[]; queries: { query: string; params?: Record<string, unknown> }[] } = {
+      command: [],
+      queries: [],
+    };
+    const command = vi.fn(async ({ query }: { query: string }) => {
+      calls.command.push(query);
+      commandImpl?.(query);
+    });
+    const query = vi.fn(async ({ query, query_params }: { query: string; query_params?: Record<string, unknown> }) => {
+      calls.queries.push({ query, params: query_params });
+      if (query.includes('FROM system.tables') && query.includes('match(name')) {
+        return { json: async () => liveTables.map((name) => ({ name })) };
+      }
+      return { json: async () => [{ create_table_query: 'TTL ts + toIntervalDay(30)' }] };
+    });
+    vi.doMock('@clickhouse/client', () => ({
+      createClient: vi.fn(() => ({ query, command, insert: vi.fn(), close: vi.fn() })),
+    }));
+    return calls;
+  }
+
+  it('drops every disabled system-log table that exists, including numbered upgrade leftovers', async () => {
+    vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
+
+    // What system.tables would return: live tables, numbered _N copies from past
+    // upgrades, and the newly-disabled histogram_metric_log.
+    const liveTables = ['trace_log', 'trace_log_3', 'trace_log_5', 'metric_log', 'metric_log_0', 'histogram_metric_log'];
+    const calls = mockClient(liveTables);
+
+    const { initClickHouse } = await import('@/src/lib/clickhouse/client');
+    await initClickHouse();
+
+    // The enumeration matches the disabled families plus an optional _<N> suffix,
+    // and now includes histogram_metric_log.
+    const enumeration = calls.queries.find((q) => q.query.includes('match(name'));
+    expect(enumeration?.params?.pattern).toBe(
+      '^(metric_log|asynchronous_metric_log|trace_log|query_log|query_thread_log|query_views_log|' +
+      'part_log|processors_profile_log|text_log|session_log|opentelemetry_span_log|blob_storage_log|' +
+      'backup_log|histogram_metric_log)(_[0-9]+)?$',
+    );
+
+    // Exactly the tables that exist are dropped — the _N leftovers included.
+    for (const name of liveTables) {
+      expect(calls.command).toContain(`DROP TABLE IF EXISTS system.${name} SYNC`);
+    }
+    const drops = calls.command.filter((q) => q.startsWith('DROP TABLE IF EXISTS system.'));
+    expect(drops).toHaveLength(liveTables.length);
+  });
+
+  it('does not abort init when dropping system-log tables fails (insufficient privileges)', async () => {
+    vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
+
+    const dropAttempts: string[] = [];
+    const calls = mockClient(['trace_log', 'metric_log', 'part_log'], (q) => {
+      if (q.startsWith('DROP TABLE IF EXISTS system.')) {
+        dropAttempts.push(q);
+        throw new Error('Not enough privileges. To execute this query, it is necessary to have the grant DROP TABLE');
+      }
+    });
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const { initClickHouse } = await import('@/src/lib/clickhouse/client');
+    // Best-effort: a privilege error must not reject and abort startup.
+    await expect(initClickHouse()).resolves.toBeUndefined();
+
+    // Bails out after the first failure rather than spamming a warning per table.
+    expect(dropAttempts).toHaveLength(1);
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn.mock.calls[0][0]).toContain('could not drop disabled system log tables');
+    void calls;
+
+    warn.mockRestore();
+  });
+
   it('returns full WAF stats for the filtered result set', async () => {
     vi.stubEnv('CLICKHOUSE_PASSWORD', 'test-clickhouse-password');
 
@@ -77,7 +214,7 @@ describe('clickhouse client analytics enablement', () => {
 
     const { queryWafEventStatsWithSearch } = await import('@/src/lib/clickhouse/client');
 
-    await expect(queryWafEventStatsWithSearch('fuo.fi')).resolves.toEqual({
+    await expect(queryWafEventStatsWithSearch('example.com')).resolves.toEqual({
       total: 5400,
       blocked: 5400,
       critical: 5400,

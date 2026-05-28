@@ -59,6 +59,36 @@ export type LocationRule = {
   upstreams: string[]; // e.g. ["backend:8080", "backend2:8080"]
 };
 
+export const PATH_BLOCK_STATUS_CODES = [400, 401, 403, 404, 410, 418, 451, 500, 502, 503] as const;
+export type PathBlockStatusCode = (typeof PATH_BLOCK_STATUS_CODES)[number];
+
+export type PathBlockRule = {
+  path: string;                    // Caddy path pattern, e.g. "/dns-query"
+  status: PathBlockStatusCode;     // status code to return, e.g. 403
+  body?: string;                   // optional response body, e.g. "Forbidden"
+};
+
+export type PathRewriteRule = {
+  from: string;   // path pattern, e.g. "/secretpath"
+  to: string;     // internal target URI, e.g. "/dns-query"
+};
+
+// Suggested status codes for the error-page UI. Any 4xx/5xx code is accepted by
+// the sanitizer; this list only drives the picker.
+export const ERROR_PAGE_STATUS_CODES = [400, 401, 403, 404, 408, 429, 500, 502, 503, 504] as const;
+
+export type ErrorPageRule = {
+  statuses: number[];     // error codes this rule handles, e.g. [502, 503, 504]; empty = all errors
+  body: string;           // response body (HTML/text); the original status code is preserved
+  contentType?: string;   // optional Content-Type, defaults to "text/html; charset=utf-8"
+};
+
+export type PathAllowRule = {
+  path: string;   // Caddy path pattern, e.g. "/secret" — matches short-circuit the
+                  // subroute (no block applies) and the request falls through to the
+                  // upstream proxy.
+};
+
 export type WafHostConfig = {
   enabled?: boolean;
   mode?: 'Off' | 'On';
@@ -325,6 +355,10 @@ type ProxyHostMeta = {
   redirects?: RedirectRule[];
   rewrite?: RewriteConfig;
   location_rules?: LocationRule[];
+  path_allows?: PathAllowRule[];
+  path_blocks?: PathBlockRule[];
+  path_rewrites?: PathRewriteRule[];
+  error_pages?: ErrorPageRule[];
 };
 
 export type ProxyHost = {
@@ -357,6 +391,10 @@ export type ProxyHost = {
   redirects: RedirectRule[];
   rewrite: RewriteConfig | null;
   locationRules: LocationRule[];
+  pathAllows: PathAllowRule[];
+  pathBlocks: PathBlockRule[];
+  pathRewrites: PathRewriteRule[];
+  errorPages: ErrorPageRule[];
 };
 
 export type ProxyHostInput = {
@@ -386,6 +424,10 @@ export type ProxyHostInput = {
   redirects?: RedirectRule[] | null;
   rewrite?: RewriteConfig | null;
   locationRules?: LocationRule[] | null;
+  pathAllows?: PathAllowRule[] | null;
+  pathBlocks?: PathBlockRule[] | null;
+  pathRewrites?: PathRewriteRule[] | null;
+  errorPages?: ErrorPageRule[] | null;
 };
 
 type ProxyHostRow = typeof proxyHosts.$inferSelect;
@@ -716,6 +758,25 @@ function serializeMeta(meta: ProxyHostMeta | null | undefined) {
     normalized.location_rules = meta.location_rules;
   }
 
+  if (meta.path_allows && meta.path_allows.length > 0) {
+    normalized.path_allows = meta.path_allows;
+  }
+
+  if (meta.path_blocks && meta.path_blocks.length > 0) {
+    normalized.path_blocks = meta.path_blocks;
+  }
+
+  if (meta.path_rewrites && meta.path_rewrites.length > 0) {
+    normalized.path_rewrites = meta.path_rewrites;
+  }
+
+  if (meta.error_pages && meta.error_pages.length > 0) {
+    const errorPages = sanitizeErrorPageRules(meta.error_pages);
+    if (errorPages.length > 0) {
+      normalized.error_pages = errorPages;
+    }
+  }
+
   return Object.keys(normalized).length > 0 ? JSON.stringify(normalized) : null;
 }
 
@@ -743,6 +804,96 @@ function sanitizeRewriteConfig(value: unknown): RewriteConfig | null {
   const prefix = typeof v.path_prefix === "string" ? v.path_prefix.trim() : null;
   if (!prefix) return null;
   return { path_prefix: prefix };
+}
+
+function sanitizePathAllows(value: unknown): PathAllowRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: PathAllowRule[] = [];
+  for (const item of value) {
+    if (item && typeof item === "object" && typeof item.path === "string" && item.path.trim()) {
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const path = item.path.trim().replace(/\{[^}]*\}/g, "");
+      if (path) {
+        valid.push({ path });
+      }
+    }
+  }
+  return valid;
+}
+
+function sanitizePathBlocks(value: unknown): PathBlockRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: PathBlockRule[] = [];
+  for (const item of value) {
+    if (
+      item &&
+      typeof item === "object" &&
+      typeof item.path === "string" && item.path.trim() &&
+      typeof item.status === "number" &&
+      (PATH_BLOCK_STATUS_CODES as readonly number[]).includes(item.status)
+    ) {
+      const rule: PathBlockRule = {
+        // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+        path: item.path.trim().replace(/\{[^}]*\}/g, ""),
+        status: item.status as PathBlockStatusCode,
+      };
+      if (typeof item.body === "string" && item.body.length > 0) {
+        rule.body = item.body.slice(0, 4096);
+      }
+      if (rule.path) {
+        valid.push(rule);
+      }
+    }
+  }
+  return valid;
+}
+
+function sanitizePathRewrites(value: unknown): PathRewriteRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: PathRewriteRule[] = [];
+  for (const item of value) {
+    if (
+      item &&
+      typeof item === "object" &&
+      typeof item.from === "string" && item.from.trim() &&
+      typeof item.to === "string" && item.to.trim()
+    ) {
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const from = item.from.trim().replace(/\{[^}]*\}/g, "");
+      // codeql[js/polynomial-redos] false positive: [^}]* is linear, no backtracking ambiguity
+      const to = item.to.trim().replace(/\{[^}]*\}/g, "");
+      if (from && to) {
+        valid.push({ from, to });
+      }
+    }
+  }
+  return valid;
+}
+
+const ERROR_PAGE_BODY_MAX = 65536;
+const ERROR_PAGE_CONTENT_TYPE_MAX = 128;
+
+export function sanitizeErrorPageRules(value: unknown): ErrorPageRule[] {
+  if (!Array.isArray(value)) return [];
+  const valid: ErrorPageRule[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const body = typeof item.body === "string" ? item.body : "";
+    if (!body) continue; // a rule with no body would do nothing
+    const rawStatuses: unknown[] = Array.isArray(item.statuses) ? item.statuses : [];
+    const statuses = [...new Set(
+      rawStatuses.filter((s): s is number =>
+        typeof s === "number" && Number.isInteger(s) && s >= 400 && s <= 599)
+    )];
+    const rule: ErrorPageRule = { statuses, body: body.slice(0, ERROR_PAGE_BODY_MAX) };
+    if (typeof item.contentType === "string") {
+      // Strip CR/LF to prevent response header injection.
+      const ct = item.contentType.replace(/[\r\n]/g, "").trim().slice(0, ERROR_PAGE_CONTENT_TYPE_MAX);
+      if (ct) rule.contentType = ct;
+    }
+    valid.push(rule);
+  }
+  return valid;
 }
 
 function sanitizeLocationRules(value: unknown): LocationRule[] {
@@ -787,6 +938,10 @@ function parseMeta(value: string | null): ProxyHostMeta {
       redirects: sanitizeRedirectRules(parsed.redirects),
       rewrite: sanitizeRewriteConfig(parsed.rewrite) ?? undefined,
       location_rules: sanitizeLocationRules(parsed.location_rules),
+      path_allows: sanitizePathAllows(parsed.path_allows),
+      path_blocks: sanitizePathBlocks(parsed.path_blocks),
+      path_rewrites: sanitizePathRewrites(parsed.path_rewrites),
+      error_pages: sanitizeErrorPageRules(parsed.error_pages),
     };
   } catch (error) {
     console.warn("Failed to parse proxy host meta", error);
@@ -1317,6 +1472,42 @@ function buildMeta(existing: ProxyHostMeta, input: Partial<ProxyHostInput>): str
     }
   }
 
+  if (input.pathAllows !== undefined) {
+    const rules = sanitizePathAllows(input.pathAllows ?? []);
+    if (rules.length > 0) {
+      next.path_allows = rules;
+    } else {
+      delete next.path_allows;
+    }
+  }
+
+  if (input.pathBlocks !== undefined) {
+    const rules = sanitizePathBlocks(input.pathBlocks ?? []);
+    if (rules.length > 0) {
+      next.path_blocks = rules;
+    } else {
+      delete next.path_blocks;
+    }
+  }
+
+  if (input.pathRewrites !== undefined) {
+    const rules = sanitizePathRewrites(input.pathRewrites ?? []);
+    if (rules.length > 0) {
+      next.path_rewrites = rules;
+    } else {
+      delete next.path_rewrites;
+    }
+  }
+
+  if (input.errorPages !== undefined) {
+    const rules = sanitizeErrorPageRules(input.errorPages ?? []);
+    if (rules.length > 0) {
+      next.error_pages = rules;
+    } else {
+      delete next.error_pages;
+    }
+  }
+
   return serializeMeta(next);
 }
 
@@ -1656,6 +1847,10 @@ function parseProxyHost(row: ProxyHostRow): ProxyHost {
     redirects: meta.redirects ?? [],
     rewrite: meta.rewrite ?? null,
     locationRules: meta.location_rules ?? [],
+    pathAllows: meta.path_allows ?? [],
+    pathBlocks: meta.path_blocks ?? [],
+    pathRewrites: meta.path_rewrites ?? [],
+    errorPages: meta.error_pages ?? [],
   };
 }
 
@@ -1801,6 +1996,10 @@ export async function updateProxyHost(id: number, input: Partial<ProxyHostInput>
     ...(existing.redirects && existing.redirects.length > 0 ? { redirects: existing.redirects } : {}),
     ...(existing.rewrite ? { rewrite: existing.rewrite } : {}),
     ...(existing.locationRules && existing.locationRules.length > 0 ? { location_rules: existing.locationRules } : {}),
+    ...(existing.pathAllows && existing.pathAllows.length > 0 ? { path_allows: existing.pathAllows } : {}),
+    ...(existing.pathBlocks && existing.pathBlocks.length > 0 ? { path_blocks: existing.pathBlocks } : {}),
+    ...(existing.pathRewrites && existing.pathRewrites.length > 0 ? { path_rewrites: existing.pathRewrites } : {}),
+    ...(existing.errorPages && existing.errorPages.length > 0 ? { error_pages: existing.errorPages } : {}),
   };
   const meta = buildMeta(existingMeta, input);
 

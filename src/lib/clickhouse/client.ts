@@ -12,6 +12,21 @@ if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(CH_DB)) {
   throw new Error(`CLICKHOUSE_DB contains invalid characters: ${CH_DB}`);
 }
 
+const DEFAULT_RETENTION_DAYS = 30;
+
+/** Parse CLICKHOUSE_RETENTION_DAYS into a positive integer number of days. */
+function parseRetentionDays(raw: string | undefined): number {
+  if (raw == null || raw.trim() === '') return DEFAULT_RETENTION_DAYS;
+  const n = Number(raw.trim());
+  if (!Number.isInteger(n) || n <= 0) {
+    throw new Error(`CLICKHOUSE_RETENTION_DAYS must be a positive integer (got: ${raw})`);
+  }
+  return n;
+}
+
+// Number of days analytics events are kept before ClickHouse's TTL deletes them.
+const CH_RETENTION_DAYS = parseRetentionDays(process.env.CLICKHOUSE_RETENTION_DAYS);
+
 // ── Analytics state ─────────────────────────────────────────────────────────
 
 const analyticsConfigured = CH_PASS.trim().length > 0;
@@ -19,6 +34,11 @@ const analyticsConfigured = CH_PASS.trim().length > 0;
 /** Returns true when ClickHouse analytics is configured for this process. */
 export function isAnalyticsEnabled(): boolean {
   return analyticsConfigured;
+}
+
+/** Number of days analytics events are retained before TTL deletion. */
+export function getRetentionDays(): number {
+  return CH_RETENTION_DAYS;
 }
 
 // ── Singleton client ────────────────────────────────────────────────────────
@@ -63,7 +83,7 @@ CREATE TABLE IF NOT EXISTS traffic_events (
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)
 ORDER BY (host, ts)
-TTL ts + INTERVAL 90 DAY DELETE
+TTL ts + INTERVAL ${CH_RETENTION_DAYS} DAY DELETE
 SETTINGS index_granularity = 8192
 `;
 
@@ -83,7 +103,7 @@ CREATE TABLE IF NOT EXISTS waf_events (
 ) ENGINE = MergeTree()
 PARTITION BY toYYYYMM(ts)
 ORDER BY (host, ts)
-TTL ts + INTERVAL 90 DAY DELETE
+TTL ts + INTERVAL ${CH_RETENTION_DAYS} DAY DELETE
 SETTINGS index_granularity = 8192
 `;
 
@@ -112,6 +132,109 @@ const WAF_EVENTS_MIGRATIONS = [
   `ALTER TABLE waf_events MODIFY COLUMN raw_data Nullable(String) CODEC(ZSTD(3))`,
 ];
 
+const RETENTION_TABLES = ['traffic_events', 'waf_events'] as const;
+
+/** Extract the retention (in days) from a table's TTL clause, if present. */
+function ttlDaysFromCreateQuery(createQuery: string): number | null {
+  // ClickHouse normalizes `INTERVAL N DAY` to `toIntervalDay(N)` in create_table_query,
+  // but older servers may report the literal form — match both.
+  const match =
+    createQuery.match(/TTL\s+ts\s*\+\s*toIntervalDay\((\d+)\)/i) ??
+    createQuery.match(/TTL\s+ts\s*\+\s*INTERVAL\s+(\d+)\s+DAY/i);
+  return match ? Number(match[1]) : null;
+}
+
+/**
+ * Bring an existing table's TTL in line with CH_RETENTION_DAYS.
+ *
+ * `CREATE TABLE IF NOT EXISTS` never alters an existing table, so deployments
+ * created under a different retention keep their old TTL forever unless we
+ * issue an explicit MODIFY TTL. We only do so when the current TTL differs,
+ * since MODIFY TTL materializes a mutation that rewrites parts to drop expired
+ * rows — cheap to skip, wasteful to repeat on every restart.
+ */
+async function ensureRetentionTtl(ch: ClickHouseClient, table: (typeof RETENTION_TABLES)[number]): Promise<void> {
+  const result = await ch.query({
+    query: `SELECT create_table_query FROM system.tables WHERE database = {db:String} AND name = {tbl:String}`,
+    query_params: { db: CH_DB, tbl: table },
+    format: 'JSONEachRow',
+  });
+  const rows = await result.json<{ create_table_query: string }>();
+  const current = ttlDaysFromCreateQuery(rows[0]?.create_table_query ?? '');
+  if (current === CH_RETENTION_DAYS) return;
+  await ch.command({
+    query: `ALTER TABLE ${table} MODIFY TTL ts + INTERVAL ${CH_RETENTION_DAYS} DAY DELETE`,
+  });
+}
+
+// Diagnostic system-log tables that docker/clickhouse/config.d/low-disk-write.xml
+// turns off. On stock ClickHouse these flush every few seconds regardless of
+// traffic, so a deployment that ran before the override accumulated gigabytes we
+// can now reclaim. Disabling only stops new writes; the old data lingers until
+// the tables are dropped, which is what this list drives.
+const DISABLED_SYSTEM_LOGS = [
+  'metric_log',
+  'asynchronous_metric_log',
+  'trace_log',
+  'query_log',
+  'query_thread_log',
+  'query_views_log',
+  'part_log',
+  'processors_profile_log',
+  'text_log',
+  'session_log',
+  'opentelemetry_span_log',
+  'blob_storage_log',
+  'backup_log',
+  'histogram_metric_log',
+] as const;
+
+// Matches a disabled log table and its numbered upgrade leftovers. When a
+// ClickHouse upgrade changes a system-log table's schema, the server renames
+// the old table to `<name>_<N>` (e.g. trace_log_3) and creates a fresh one;
+// those frozen copies are never cleaned up and, on long-lived deployments,
+// dwarf the live table. An exact-name drop misses them, so we match the
+// `_<N>` suffix too. Anchored to full names built from the trusted constant
+// list above — no user input reaches this regex.
+const DISABLED_SYSTEM_LOG_PATTERN = `^(${DISABLED_SYSTEM_LOGS.join('|')})(_[0-9]+)?$`;
+
+/**
+ * Drop the diagnostic system-log tables we disable via config — including the
+ * numbered `_<N>` copies left behind by past version upgrades — so their
+ * already-written data is reclaimed. Best-effort: the analytics user often
+ * lacks DROP on the `system` database, so a failure is logged once and ignored
+ * rather than aborting startup.
+ */
+async function dropDisabledSystemLogs(ch: ClickHouseClient): Promise<void> {
+  let names: string[];
+  try {
+    const result = await ch.query({
+      query: `SELECT name FROM system.tables WHERE database = 'system' AND match(name, {pattern:String})`,
+      query_params: { pattern: DISABLED_SYSTEM_LOG_PATTERN },
+      format: 'JSONEachRow',
+    });
+    names = (await result.json<{ name: string }>())
+      .map((row) => row.name)
+      .filter((name): name is string => typeof name === 'string' && name.length > 0);
+  } catch (err) {
+    console.warn(`[clickhouse] could not list disabled system log tables to drop: ${(err as Error).message}`);
+    return;
+  }
+
+  for (const name of names) {
+    try {
+      await ch.command({ query: `DROP TABLE IF EXISTS system.${name} SYNC` });
+    } catch (err) {
+      console.warn(
+        `[clickhouse] could not drop disabled system log tables (insufficient privileges?); ` +
+        `they will stop growing once the config override is applied, but existing data must be ` +
+        `cleared manually. Reason: ${(err as Error).message}`,
+      );
+      return;
+    }
+  }
+}
+
 export async function initClickHouse(): Promise<void> {
   if (!analyticsConfigured) {
     console.log('ClickHouse analytics disabled (CLICKHOUSE_PASSWORD not set)');
@@ -124,6 +247,10 @@ export async function initClickHouse(): Promise<void> {
   for (const q of [...TRAFFIC_EVENTS_MIGRATIONS, ...WAF_EVENTS_MIGRATIONS]) {
     await ch.command({ query: q });
   }
+  for (const table of RETENTION_TABLES) {
+    await ensureRetentionTtl(ch, table);
+  }
+  await dropDisabledSystemLogs(ch);
 }
 
 export async function closeClickHouse(): Promise<void> {

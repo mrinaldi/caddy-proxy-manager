@@ -17,7 +17,13 @@ import {
   type MtlsConfig,
   type RedirectRule,
   type RewriteConfig,
-  type CpmForwardAuthInput
+  type PathAllowRule,
+  type PathBlockRule,
+  type PathRewriteRule,
+  type ErrorPageRule,
+  type CpmForwardAuthInput,
+  PATH_BLOCK_STATUS_CODES,
+  sanitizeErrorPageRules
 } from "@/src/lib/models/proxy-hosts";
 import { getCertificate } from "@/src/lib/models/certificates";
 import { setForwardAuthAccess } from "@/src/lib/models/forward-auth";
@@ -271,10 +277,10 @@ function parseLoadBalancerConfig(formData: FormData): LoadBalancerInput | undefi
 
 function parseGeoBlockConfig(formData: FormData): {
   geoblock: GeoBlockSettings | null;
-  geoblock_mode: GeoBlockMode;
+  geoblockMode: GeoBlockMode;
 } {
   if (!formData.has("geoblockPresent")) {
-    return { geoblock: null, geoblock_mode: "merge" };
+    return { geoblock: null, geoblockMode: "merge" };
   }
 
   const enabled = parseCheckbox(formData.get("geoblockEnabled"));
@@ -318,7 +324,7 @@ function parseGeoBlockConfig(formData: FormData): {
     redirect_url: parseRedirectUrl(formData.get("geoblockRedirectUrl")),
   };
 
-  return { geoblock: config, geoblock_mode: mode };
+  return { geoblock: config, geoblockMode: mode };
 }
 
 // Helper: parse response headers from geoblock_response_headers_keys[] and geoblock_response_headers_values[]
@@ -477,6 +483,63 @@ function parseRewriteConfig(formData: FormData): RewriteConfig | null {
   return { path_prefix: prefix.trim() };
 }
 
+function parsePathAllowsConfig(formData: FormData): PathAllowRule[] | null {
+  const raw = formData.get("pathAllowsJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (r) => r && typeof r.path === "string" && r.path.trim()
+    ) as PathAllowRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parsePathBlocksConfig(formData: FormData): PathBlockRule[] | null {
+  const raw = formData.get("pathBlocksJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    const valid = (PATH_BLOCK_STATUS_CODES as readonly number[]);
+    return parsed.filter(
+      (r) =>
+        r &&
+        typeof r.path === "string" &&
+        typeof r.status === "number" &&
+        valid.includes(r.status)
+    ) as PathBlockRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parsePathRewritesConfig(formData: FormData): PathRewriteRule[] | null {
+  const raw = formData.get("pathRewritesJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return null;
+    return parsed.filter(
+      (r) => r && typeof r.from === "string" && typeof r.to === "string"
+    ) as PathRewriteRule[];
+  } catch {
+    return null;
+  }
+}
+
+function parseErrorPagesConfig(formData: FormData): ErrorPageRule[] | null {
+  const raw = formData.get("errorPagesJson");
+  if (!raw || typeof raw !== "string") return null;
+  try {
+    return sanitizeErrorPageRules(JSON.parse(raw));
+  } catch {
+    return null;
+  }
+}
+
 function parseUpstreamDnsResolutionConfig(formData: FormData): UpstreamDnsResolutionInput | undefined {
   if (!formData.has("upstreamDnsResolutionPresent")) {
     return undefined;
@@ -551,6 +614,10 @@ export async function createProxyHostAction(
         redirects: parseRedirectsConfig(formData),
         rewrite: parseRewriteConfig(formData),
         locationRules: parseLocationRulesConfig(formData),
+        pathAllows: parsePathAllowsConfig(formData),
+        pathBlocks: parsePathBlocksConfig(formData),
+        pathRewrites: parsePathRewritesConfig(formData),
+        errorPages: parseErrorPagesConfig(formData),
       },
       userId
     );
@@ -637,6 +704,10 @@ export async function updateProxyHostAction(
         redirects: formData.has("redirectsJson") ? parseRedirectsConfig(formData) : undefined,
         rewrite: formData.has("rewritePathPrefix") ? parseRewriteConfig(formData) : undefined,
         locationRules: formData.has("locationRulesJson") ? parseLocationRulesConfig(formData) : undefined,
+        pathAllows: formData.has("pathAllowsJson") ? parsePathAllowsConfig(formData) : undefined,
+        pathBlocks: formData.has("pathBlocksJson") ? parsePathBlocksConfig(formData) : undefined,
+        pathRewrites: formData.has("pathRewritesJson") ? parsePathRewritesConfig(formData) : undefined,
+        errorPages: formData.has("errorPagesJson") ? parseErrorPagesConfig(formData) : undefined,
       },
       userId
     );
