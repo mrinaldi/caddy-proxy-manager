@@ -29,6 +29,9 @@ RUN GOOS=$TARGETOS GOARCH=$TARGETARCH xcaddy build master \
     --with github.com/caddy-dns/ionos \
     --with github.com/caddy-dns/linode \
     --with github.com/caddy-dns/njalla \
+    --with github.com/caddy-dns/spaceship \
+    --with github.com/caddy-dns/desec \
+    --with github.com/caddy-dns/dynu \
     --with github.com/mholt/caddy-l4 \
     --with github.com/fuomag9/caddy-blocker-plugin \
     --with github.com/corazawaf/coraza-caddy/v2 \
@@ -56,8 +59,9 @@ RUN (getent group ${PGID} && groupdel $(getent group ${PGID} | cut -d: -f1) || t
     (getent passwd ${PUID} && userdel $(getent passwd ${PUID} | cut -d: -f1) || true) && \
     groupadd -g ${PGID} caddy && \
     useradd -r -u ${PUID} -g caddy -m -d /home/caddy caddy && \
-    mkdir -p /data /config /logs && \
-    chown -R caddy:caddy /data /config /logs /home/caddy
+    mkdir -p /data /config /logs /acme-ca && \
+    chown -R caddy:caddy /data /config /logs /home/caddy && \
+    chmod 0777 /acme-ca
 
 COPY --chown=caddy:caddy docker/caddy/Caddyfile /etc/caddy/Caddyfile
 

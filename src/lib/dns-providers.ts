@@ -200,6 +200,37 @@ export const DNS_PROVIDERS: DnsProviderDefinition[] = [
       { key: "api_token", label: "API Token", type: "password", required: true },
     ],
   },
+  {
+    name: "spaceship",
+    displayName: "Spaceship",
+    description: "Spaceship DNS API",
+    docsUrl: "https://github.com/caddy-dns/spaceship",
+    modulePath: "github.com/caddy-dns/spaceship",
+    fields: [
+      { key: "api_key", label: "API Key", type: "password", required: true },
+      { key: "api_secret", label: "API Secret", type: "password", required: true },
+    ],
+  },
+  {
+    name: "desec",
+    displayName: "deSEC",
+    description: "deSEC DNS API",
+    docsUrl: "https://github.com/caddy-dns/desec",
+    modulePath: "github.com/caddy-dns/desec",
+    fields: [
+      { key: "token", label: "API Token", type: "password", required: true },
+    ],
+  },
+  {
+    name: "dynu",
+    displayName: "Dynu",
+    description: "Dynu DNS API",
+    docsUrl: "https://github.com/caddy-dns/dynu",
+    modulePath: "github.com/caddy-dns/dynu",
+    fields: [
+      { key: "api_token", label: "API Token", type: "password", required: true },
+    ],
+  },
 ];
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

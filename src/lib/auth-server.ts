@@ -12,13 +12,19 @@ import type { GenericOAuthConfig } from "better-auth/plugins";
 let cachedAuth: any = null;
 let cachedProviders: GenericOAuthConfig[] | null = null;
 
-function mapOAuthProvider(p: OAuthProvider): GenericOAuthConfig {
+export function mapOAuthProvider(p: OAuthProvider): GenericOAuthConfig {
   const cfg: GenericOAuthConfig = {
     providerId: p.id,
     clientId: p.clientId,
     clientSecret: p.clientSecret,
     scopes: p.scopes ? p.scopes.split(/[\s,]+/).filter(Boolean) : undefined,
     pkce: true,
+    // Security: do not let an OAuth sign-in implicitly create a brand-new
+    // account unless OAuth self-registration is explicitly enabled. Existing
+    // users and (where configured) account linking still work — only first-time
+    // auto-provisioning of an unknown identity is gated. Controlled by its own
+    // flag, independent of credential self-registration.
+    disableImplicitSignUp: !config.auth.allowOauthRegistration,
   };
   if (p.authorizationUrl) cfg.authorizationUrl = p.authorizationUrl;
   if (p.tokenUrl) cfg.tokenUrl = p.tokenUrl;
@@ -72,6 +78,24 @@ function loadProvidersSync(): GenericOAuthConfig[] {
   return cachedProviders;
 }
 
+/**
+ * Security: force privileged user fields to safe defaults on every
+ * better-auth-managed user creation (OAuth signup, and credential signup when
+ * enabled). better-auth's generic-OAuth signup spreads the raw IdP profile
+ * claims into the new user record (createOAuthUser({...restUserInfo})) and does
+ * NOT honour the `input:false` flags declared on these additionalFields, so
+ * without this a permissive or attacker-influenced IdP returning a `role` (or
+ * `status`) claim could self-provision an admin account.
+ *
+ * Admin-initiated user creation goes through models/user.ts (a direct insert
+ * that bypasses better-auth's database hooks), so legitimate role assignment is
+ * unaffected. `provider`/`subject` are informational, not access-control, and
+ * are intentionally left untouched.
+ */
+export function enforceSafeUserDefaults<T extends object>(user: T): T & { role: string; status: string } {
+  return { ...user, role: "user", status: "active" };
+}
+
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function createAuth(): any {
   const oauthConfigs = loadProvidersSync();
@@ -117,6 +141,7 @@ function createAuth(): any {
     verification: { modelName: "verifications" },
     emailAndPassword: {
       enabled: true,
+      disableSignUp: !config.auth.allowSelfRegistration,
       password: {
         async hash(password: string) {
           const bcrypt = await import("bcryptjs");
@@ -129,6 +154,20 @@ function createAuth(): any {
       },
     },
     databaseHooks: {
+      user: {
+        create: {
+          // By default, never let an external IdP set privileged fields
+          // (role/status) on a newly federated user — see enforceSafeUserDefaults
+          // above. Operators who trust their IdP to manage roles can opt out
+          // with AUTH_ALLOW_OAUTH_ROLE_FROM_CLAIMS=true.
+          before: async (user: Record<string, unknown>) => {
+            if (config.auth.allowOauthRoleFromClaims) {
+              return { data: user };
+            }
+            return { data: enforceSafeUserDefaults(user) };
+          },
+        },
+      },
       account: {
         create: {
           before: async (account) => {

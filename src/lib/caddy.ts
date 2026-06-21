@@ -1,6 +1,6 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, writeFileSync, rmSync } from "node:fs";
 import { Resolver } from "node:dns/promises";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { isIP } from "node:net";
 import crypto from "node:crypto";
 import {
@@ -27,6 +27,7 @@ import { eq, isNull } from "drizzle-orm";
 import { config } from "./config";
 import {
   getGeneralSettings,
+  getAcmeSettings,
   getMetricsSettings,
   getLoggingSettings,
   getDnsSettings,
@@ -36,6 +37,7 @@ import {
   getWafSettings,
   getErrorPagesSettings,
   setSetting,
+  type AcmeSettings,
   type DnsSettings,
   type UpstreamDnsAddressFamily,
   type UpstreamDnsResolutionSettings,
@@ -61,6 +63,41 @@ import { applyCaddyConfigMerge } from "./caddy-merge";
 
 const CERTS_DIR = process.env.CERTS_DIRECTORY || join(process.cwd(), "data", "certs");
 mkdirSync(CERTS_DIR, { recursive: true, mode: 0o700 });
+
+// Directory shared (via a Docker volume) with the Caddy container, so a
+// custom ACME CA root PEM written here by the web container is readable by
+// Caddy at the same path for `trusted_roots_pem_files`. Read lazily so tests
+// (and non-Docker deployments) can override ACME_CA_ROOT_DIR at runtime.
+function acmeCaRootFile(): string {
+  return join(process.env.ACME_CA_ROOT_DIR || "/acme-ca", "custom-ca-root.pem");
+}
+
+/**
+ * Persist (or clear) the custom ACME CA root PEM to the shared volume and
+ * return the file path Caddy should reference, or null if no root is
+ * configured or the file could not be written (in which case the issuer is
+ * left without `trusted_roots_pem_files` rather than pointing at a missing file).
+ */
+function syncAcmeCaRootFile(caRootPem: string | undefined): string | null {
+  const file = acmeCaRootFile();
+  const pem = caRootPem?.trim();
+  if (!pem) {
+    try {
+      rmSync(file, { force: true });
+    } catch {
+      // best-effort cleanup
+    }
+    return null;
+  }
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeFileSync(file, pem.endsWith("\n") ? pem : `${pem}\n`, { mode: 0o644 });
+    return file;
+  } catch (error) {
+    console.error(`Failed to write ACME CA root PEM to ${file}`, error);
+    return null;
+  }
+}
 
 const DEFAULT_AUTHENTIK_HEADERS = [
   "X-Authentik-Username",
@@ -1295,6 +1332,27 @@ async function buildProxyRoutes(
           "X-CPM-User-Id"
         ];
 
+        // Security: strip any client-supplied CPM identity headers from the
+        // inbound request before it ever reaches the upstream. These headers
+        // are injected solely by CPM from the verify response; accepting them
+        // from the client would let a caller spoof their identity / group
+        // membership to upstream apps. This must run on EVERY route — protected,
+        // unprotected catch-all, excluded, and location — because on routes
+        // without the auth handler nothing else would remove them, and on
+        // authenticated routes the copy step below only overwrites a header
+        // when the verify response value is non-empty (e.g. a user in no group
+        // returns an empty X-CPM-Groups, which would otherwise leave the
+        // client's forged value intact).
+        const cpmStripHeadersHandler: Record<string, unknown> = {
+          handler: "headers",
+          request: {
+            delete: [...CPM_COPY_HEADERS]
+          }
+        };
+        // Prepend the strip handler to the shared handler chain for all CPM
+        // forward-auth routes.
+        const cpmHandlers = [cpmStripHeadersHandler, ...handlers];
+
         // Build handle_response routes for copying user headers on 2xx
         const cpmHandleResponseRoutes: Record<string, unknown>[] = [
           { handle: [{ handler: "vars" }] }
@@ -1398,7 +1456,7 @@ async function buildProxyRoutes(
 
             // Protected paths
             for (const protectedPath of cpmForwardAuth.protected_paths) {
-              const protectedHandlers: Record<string, unknown>[] = [...handlers];
+              const protectedHandlers: Record<string, unknown>[] = [...cpmHandlers];
               const protectedReverseProxy = JSON.parse(JSON.stringify(reverseProxyHandler));
               protectedHandlers.push(cpmForwardAuthHandler);
               protectedHandlers.push(protectedReverseProxy);
@@ -1420,7 +1478,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, locationProxy],
+                handle: [...cpmHandlers, locationProxy],
                 terminal: true
               });
             }
@@ -1428,7 +1486,7 @@ async function buildProxyRoutes(
             // Unprotected catch-all
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, reverseProxyHandler],
+              handle: [...cpmHandlers, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1445,7 +1503,7 @@ async function buildProxyRoutes(
             for (const excludedPath of cpmForwardAuth.excluded_paths) {
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [excludedPath] }],
-                handle: [...handlers, JSON.parse(JSON.stringify(reverseProxyHandler))],
+                handle: [...cpmHandlers, JSON.parse(JSON.stringify(reverseProxyHandler))],
                 terminal: true
               });
             }
@@ -1460,7 +1518,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, cpmForwardAuthHandler, locationProxy],
+                handle: [...cpmHandlers, cpmForwardAuthHandler, locationProxy],
                 terminal: true
               });
             }
@@ -1468,7 +1526,7 @@ async function buildProxyRoutes(
             // Catch-all with auth (everything not excluded)
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, cpmForwardAuthHandler, reverseProxyHandler],
+              handle: [...cpmHandlers, cpmForwardAuthHandler, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1491,7 +1549,7 @@ async function buildProxyRoutes(
               if (!safePath) continue;
               hostRoutes.push({
                 match: [{ host: domainGroup, path: [safePath] }],
-                handle: [...handlers, cpmForwardAuthHandler, locationProxy],
+                handle: [...cpmHandlers, cpmForwardAuthHandler, locationProxy],
                 terminal: true
               });
             }
@@ -1499,7 +1557,7 @@ async function buildProxyRoutes(
             // Main route with forward auth
             hostRoutes.push({
               match: [{ host: domainGroup }],
-              handle: [...handlers, cpmForwardAuthHandler, reverseProxyHandler],
+              handle: [...cpmHandlers, cpmForwardAuthHandler, reverseProxyHandler],
               terminal: true
             });
           }
@@ -1837,10 +1895,10 @@ function buildTlsConnectionPolicies(
   };
 }
 
-async function buildTlsAutomation(
+export async function buildTlsAutomation(
   usage: Map<number, CertificateUsage>,
   autoManagedDomains: Set<string>,
-  options: { acmeEmail?: string; dnsSettings?: DnsSettings | null }
+  options: { acmeEmail?: string; dnsSettings?: DnsSettings | null; acmeSettings?: AcmeSettings | null }
 ) {
   const managedEntries = Array.from(usage.values()).filter(
     (entry) => entry.certificate.type === "managed" && Boolean(entry.certificate.autoRenew)
@@ -1875,12 +1933,27 @@ async function buildTlsAutomation(
   const managedCertificateIds = new Set<number>();
   const policies: Record<string, unknown>[] = [];
 
+  // Custom ACME directory URL + trusted root for internal CAs (OpenBao, Step-CA, etc.)
+  const acmeSettings = options.acmeSettings ?? await getAcmeSettings();
+  const customAcmeUrl = acmeSettings?.caUrl?.trim() || null;
+  const acmeRootPath = syncAcmeCaRootFile(acmeSettings?.caRootPem);
+
+  const applyAcmeOverrides = (issuer: Record<string, unknown>) => {
+    if (customAcmeUrl) {
+      issuer.ca = customAcmeUrl;
+    }
+    if (acmeRootPath) {
+      issuer.trusted_roots_pem_files = [acmeRootPath];
+    }
+  };
+
   // Add policy for auto-managed domains (certificateId = null)
   if (hasAutoManagedDomains) {
     for (const subjects of groupHostPatternsByPriority(Array.from(autoManagedDomains))) {
       const issuer: Record<string, unknown> = {
         module: "acme"
       };
+      applyAcmeOverrides(issuer);
 
       if (options.acmeEmail) {
         issuer.email = options.acmeEmail;
@@ -1927,6 +2000,7 @@ async function buildTlsAutomation(
       const issuer: Record<string, unknown> = {
         module: "acme"
       };
+      applyAcmeOverrides(issuer);
 
       if (options.acmeEmail) {
         issuer.email = options.acmeEmail;
@@ -2171,8 +2245,8 @@ async function buildL4Servers(): Promise<Record<string, unknown> | null> {
   return servers;
 }
 
-async function buildCaddyDocument() {
-  const [proxyHostRecords, certRows, accessListEntryRecords, caCertRows, issuedClientCertRows, allIssuedCaCertIds, allIssuedCertCaMap] = await Promise.all([
+export async function buildCaddyDocument() {
+  const [proxyHostRecords, certRows, accessListEntryRecords, caCertRows, issuedClientCertRows, allIssuedCaCertIds] = await Promise.all([
     db
       .select({
         id: proxyHosts.id,
@@ -2229,15 +2303,6 @@ async function buildCaddyDocument() {
     // (trust any cert signed by that CA).
     db
       .selectDistinct({ caCertificateId: issuedClientCertificates.caCertificateId })
-      .from(issuedClientCertificates),
-    // All issued certs (including revoked) — cert ID → CA ID only.
-    // Used to derive CA IDs for the new trust model even when all certs are revoked,
-    // so the domain stays in mTlsDomainMap and gets a fail-closed mTLS policy.
-    db
-      .select({
-        id: issuedClientCertificates.id,
-        caCertificateId: issuedClientCertificates.caCertificateId
-      })
       .from(issuedClientCertificates)
   ]);
 
@@ -2294,8 +2359,6 @@ async function buildCaddyDocument() {
 
   // Build a lookup: issued cert ID → { id, caCertificateId, certificatePem } (active only)
   const issuedCertById = new Map(issuedClientCertRows.map(r => [r.id, r]));
-  // Cert ID → CA ID for ALL certs (including revoked), used to derive CA IDs for fail-closed
-  const certIdToCaId = new Map(allIssuedCertCaMap.map(r => [r.id, r.caCertificateId]));
 
   // Resolve role IDs → cert IDs for trusted_role_ids in mTLS config
   const roleCertIdMap = await buildRoleCertIdMap();
@@ -2334,7 +2397,8 @@ async function buildCaddyDocument() {
     }
 
     if (allCertIds.size > 0) {
-      // New model: derive CAs from resolved cert IDs and collect leaf PEMs
+      // New model: pin trust to the explicitly-selected client certs — derive
+      // their CAs for chain validation and collect the leaf PEMs for pinning.
       const derivedCaIds = new Set<number>();
       const leafPems: string[] = [];
       for (const certId of allCertIds) {
@@ -2344,27 +2408,42 @@ async function buildCaddyDocument() {
           leafPems.push(cert.certificatePem);
         }
       }
-      if (derivedCaIds.size === 0) {
-        // All referenced certs are revoked — derive CAs from the full cert map
-        // (including revoked) so the domain stays in mTlsDomainMap and gets a
-        // fail-closed mTLS policy via buildClientAuthentication.
-        for (const certId of allCertIds) {
-          const caId = certIdToCaId.get(certId);
-          if (caId !== undefined) derivedCaIds.add(caId);
-        }
-        if (derivedCaIds.size === 0) continue;
-      }
-      const caIdArr = Array.from(derivedCaIds);
-      for (const domain of domains) {
-        mTlsDomainMap.set(domain, caIdArr);
-        if (leafPems.length > 0) {
+      if (leafPems.length > 0) {
+        const caIdArr = Array.from(derivedCaIds);
+        for (const domain of domains) {
+          mTlsDomainMap.set(domain, caIdArr);
           mTlsDomainLeafOverride.set(domain, leafPems);
+        }
+      } else {
+        // Every explicitly-selected cert/role resolved to ZERO active leaves
+        // (all revoked or deleted). FAIL CLOSED with a deny-all (drop) policy.
+        // Do NOT derive the CA and fall back to whole-CA trust: that would trust
+        // other active certs of the same CA that were never assigned to this
+        // host (and "request" mode would accept any presented cert). Force
+        // require_and_verify with an empty trust set → buildClientAuthentication
+        // returns null → buildTlsConnectionPolicies emits a drop-all policy.
+        for (const domain of domains) {
+          mTlsDomainMap.set(domain, []);
+          mTlsOptionalAuthDomains.delete(domain);
         }
       }
     } else if (meta.mtls.ca_certificate_ids?.length) {
       // Legacy model: trust entire CAs (backward compat)
       for (const domain of domains) {
         mTlsDomainMap.set(domain, meta.mtls.ca_certificate_ids);
+      }
+    } else {
+      // mTLS is enabled but no trust resolved — e.g. trust is role-only and
+      // every cert in those roles was revoked or the role is empty, or nothing
+      // was selected — and there is no legacy CA trust. FAIL CLOSED: keep the
+      // domain in the mTLS map with an empty CA set (buildClientAuthentication
+      // returns null → buildTlsConnectionPolicies emits a drop-all policy) and
+      // force require_and_verify so even protected/excluded-path hosts reject
+      // all connections rather than silently serving the backend with no client
+      // certificate required.
+      for (const domain of domains) {
+        mTlsDomainMap.set(domain, []);
+        mTlsOptionalAuthDomains.delete(domain);
       }
     }
   }
@@ -2378,8 +2457,9 @@ async function buildCaddyDocument() {
   ]);
 
   const { usage: certificateUsage, autoManagedDomains } = collectCertificateUsage(proxyHostRows, certificateMap);
-  const [generalSettings, dnsSettings, upstreamDnsResolutionSettings, globalGeoBlock, globalWaf] = await Promise.all([
+  const [generalSettings, acmeSettings, dnsSettings, upstreamDnsResolutionSettings, globalGeoBlock, globalWaf] = await Promise.all([
     getGeneralSettings(),
+    getAcmeSettings(),
     getDnsSettings(),
     getUpstreamDnsResolutionSettings(),
     getGeoBlockSettings(),
@@ -2387,7 +2467,8 @@ async function buildCaddyDocument() {
   ]);
   const { tlsApp, managedCertificateIds } = await buildTlsAutomation(certificateUsage, autoManagedDomains, {
     acmeEmail: generalSettings?.acmeEmail,
-    dnsSettings
+    dnsSettings,
+    acmeSettings
   });
   const { policies: tlsConnectionPolicies, readyCertificates, importedCertPems } = buildTlsConnectionPolicies(
     certificateUsage,

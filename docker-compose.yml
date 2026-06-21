@@ -42,6 +42,9 @@ services:
       ADMIN_USERNAME: ${ADMIN_USERNAME:?ERROR - ADMIN_USERNAME is required}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?ERROR - ADMIN_PASSWORD is required}
 
+      # Email/password self-registration is disabled unless explicitly enabled
+      AUTH_ALLOW_SELF_REGISTRATION: ${AUTH_ALLOW_SELF_REGISTRATION:-false}
+
       # OAuth2/OIDC Authentication (Optional - works with Authentik, Authelia, Keycloak, etc.)
       OAUTH_ENABLED: ${OAUTH_ENABLED:-false}
       OAUTH_PROVIDER_NAME: ${OAUTH_PROVIDER_NAME:-OAuth2}
@@ -66,6 +69,8 @@ services:
       - caddy-manager-data:/app/data
       - geoip-data:/usr/share/GeoIP:ro,z
       - caddy-logs:/logs:ro
+      # Custom ACME CA root PEM written here by web, read by caddy (issue #192)
+      - acme-ca:/acme-ca
     depends_on:
       caddy:
         condition: service_healthy
@@ -112,6 +117,8 @@ services:
       - caddy-config:/config
       - caddy-logs:/logs
       - geoip-data:/usr/share/GeoIP:ro,z
+      # Custom ACME CA root PEM written by web, read here for trusted_roots_pem_files (issue #192)
+      - acme-ca:/acme-ca:ro
     networks:
       - caddy-network
     healthcheck:
@@ -142,8 +149,14 @@ services:
       BUILD: 0
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+    # Security: keep the socket proxy off the shared app network. Only the
+    # l4-port-manager sidecar needs to reach its container-create API; exposing
+    # it to web/caddy/clickhouse would turn any container compromise into host
+    # root (POST + CONTAINERS = create a privileged container that mounts the
+    # host fs). This network is `internal: true` (no egress) and carries only
+    # the proxy + sidecar.
     networks:
-      - caddy-network
+      - socket-proxy
 
   # L4 Port Manager sidecar — automatically recreates the caddy container
   # when L4 proxy host ports change.
@@ -168,8 +181,11 @@ services:
         condition: service_healthy
       docker-socket-proxy:
         condition: service_started
+    # Reaches Docker only via the socket proxy (over the isolated socket-proxy
+    # network) and recreates caddy through the mounted compose dir — it does not
+    # need the shared app network.
     networks:
-      - caddy-network
+      - socket-proxy
 
   clickhouse:
     container_name: caddy-proxy-manager-clickhouse
@@ -219,6 +235,12 @@ services:
 networks:
   caddy-network:
     driver: bridge
+  # Isolated network for the Docker socket proxy and the l4-port-manager sidecar
+  # only. `internal: true` prevents external connectivity; no other service is
+  # attached, so a compromise of web/caddy/etc. cannot reach the socket proxy.
+  socket-proxy:
+    driver: bridge
+    internal: true
 
 volumes:
   caddy-manager-data:
@@ -227,3 +249,4 @@ volumes:
   caddy-logs:
   geoip-data:
   clickhouse-data:
+  acme-ca:

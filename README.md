@@ -110,7 +110,7 @@ Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, c
 - **API Tokens** - Create and manage API tokens with optional expiration for programmatic access
 - **Instance Sync** - Master/slave configuration sync for multi-instance deployments. The master pushes proxy hosts, certificates, access lists, and settings to slaves on every change
 - **OAuth / SSO** - OAuth2/OIDC authentication with any compliant provider (Authentik, Keycloak, Auth0, etc.). Account linking from the Profile page
-- **DNS Providers** - Multi-provider DNS-01 challenge support for ACME certificates: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, and Njalla. Credentials encrypted at rest. Per-certificate provider override supported
+- **DNS Providers** - Multi-provider DNS-01 challenge support for ACME certificates: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, Spaceship, deSEC, and Dynu. Credentials encrypted at rest. Per-certificate provider override supported
 - **Settings** - ACME email, DNS provider configuration, upstream DNS pinning defaults, Authentik outpost, Prometheus metrics, logging format
 - **Audit Log** - Searchable configuration change history with user attribution and pagination
 - **Search & Pagination** - Server-side search and pagination on all data tables
@@ -145,6 +145,7 @@ Data persists in Docker volumes (caddy-manager-data, caddy-data, caddy-config, c
 | `OAUTH_USERINFO_URL` | Optional OAuth userinfo endpoint override | Auto-discovered from `OAUTH_ISSUER` | No |
 | `OAUTH_ALLOW_AUTO_LINKING` | Allow auto-linking OAuth identities to existing users | `false` | No |
 | `AUTH_TRUST_HOST` | Trust the Host header for URL construction (only behind proxies that rewrite Host) | `false` | No |
+| `AUTH_ALLOW_SELF_REGISTRATION` | Allow public email/password account registration | `false` | No |
 | `AUTH_RATE_LIMIT_ENABLED` | Enable Better Auth rate limiting | `true` | No |
 | `AUTH_RATE_LIMIT_WINDOW` | Rate limit window in seconds | `60` | No |
 | `AUTH_RATE_LIMIT_MAX` | Max requests per window | `5` | No |
@@ -214,7 +215,7 @@ New users default to the **user** role. The initial admin account is created fro
 
 Caddy automatically obtains Let's Encrypt certificates for all proxy hosts.
 
-**DNS-01 Challenge** (optional): Configure a DNS provider in **Settings → DNS Providers** for wildcard certificates and environments where ports 80/443 are not public. Supported providers: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, and Njalla. Credentials are encrypted at rest with AES-256-GCM. You can override the DNS provider per certificate.
+**DNS-01 Challenge** (optional): Configure a DNS provider in **Settings → DNS Providers** for wildcard certificates and environments where ports 80/443 are not public. Supported providers: Cloudflare, Route 53, DigitalOcean, Duck DNS, Hetzner, Vultr, Porkbun, GoDaddy, Namecheap, OVH, IONOS, Linode, Njalla, Spaceship, deSEC, and Dynu. Credentials are encrypted at rest with AES-256-GCM. You can override the DNS provider per certificate.
 
 **Custom Certificates** (optional): Import your own certificates via the Certificates page. Private keys are stored unencrypted in SQLite.
 
